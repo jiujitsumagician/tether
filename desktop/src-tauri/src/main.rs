@@ -100,8 +100,8 @@ fn main() {
             let store = Arc::new(store);
 
             let options = CascadeOptions::default();
+            let _ = handle; // reserved for future use
             let pairing = Arc::new(PairingState::new(
-                handle.clone(),
                 Arc::clone(&store),
                 options,
             ));

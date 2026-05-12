@@ -5,7 +5,8 @@
 //! of the DER-encoded cert is what the emoji handshake verifies against
 //! and what gets pinned on the peer for future reconnects.
 
-use rustls::{ClientConfig, ServerConfig, ServerName};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ServerConfig};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;

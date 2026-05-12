@@ -16,7 +16,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::AppHandle;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 
@@ -34,7 +33,7 @@ pub enum PairingUiEvent {
     /// and emit `Paired` once the peer's confirm arrives).
     Card {
         peer_device_name: String,
-        emojis: [&'static str; 3],
+        emojis: [String; 3],
     },
 
     /// Manual-entry escape hatch opened. Frontend renders the IP +
@@ -55,7 +54,6 @@ pub struct PairingState {
     inner: Arc<Mutex<Inner>>,
     options: CascadeOptions,
     store: Arc<Store>,
-    _app: AppHandle,
 }
 
 struct Inner {
@@ -70,7 +68,7 @@ struct Inner {
 }
 
 impl PairingState {
-    pub fn new(app: AppHandle, store: Arc<Store>, options: CascadeOptions) -> Self {
+    pub fn new(store: Arc<Store>, options: CascadeOptions) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 ui_tx: None,
@@ -82,7 +80,6 @@ impl PairingState {
             })),
             options,
             store,
-            _app: app,
         }
     }
 
@@ -98,12 +95,15 @@ impl PairingState {
             g.peer_name = None;
         }
 
-        // Spawn the cascade + handshake driver.
-        let me = Arc::clone(self);
+        // Spawn the cascade + handshake driver. We hand a clone to
+        // the task so it can still call `emit` on the error path
+        // after `run` consumes its Arc.
+        let me_run = Arc::clone(self);
+        let me_err = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = me.run().await {
+            if let Err(e) = me_run.run().await {
                 tracing::warn!("pairing run failed: {e}");
-                let _ = me
+                let _ = me_err
                     .emit(PairingUiEvent::Mismatch {
                         reason: "protocol".into(),
                     })
@@ -248,7 +248,12 @@ impl PairingState {
         // 5. Derive verifier, send + receive verify.
         let verifier = handshake.derive(&peer_hello.body.ecdh_pubkey)?;
         let indices = emoji_code::indices_from_verifier(&verifier);
-        let emojis = emoji_code::from_verifier(&verifier);
+        let emojis_static = emoji_code::from_verifier(&verifier);
+        let emojis = [
+            emojis_static[0].to_string(),
+            emojis_static[1].to_string(),
+            emojis_static[2].to_string(),
+        ];
 
         let verify_msg = Envelope {
             v: 1,
