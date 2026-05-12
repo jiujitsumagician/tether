@@ -127,41 +127,42 @@ class PairingViewModel(
         }
     }
 
-    private suspend fun tryReconnect(known: List<PairedPcStore.Entry>): Boolean {
-        _state.value = PairingUiState.Status("cascade.mdns", allowManual = true)
-        val options = CascadeOptions(
-            localDeviceName = android.os.Build.MODEL ?: "Phone",
-            localDeviceType = "phone",
-            // Tighter timeouts for the silent path.
-            mdnsTimeoutMs = 3_000,
-            udpTimeoutMs = 1_500,
-        )
-        val events = Channel<CascadeEvent>(Channel.UNLIMITED)
-        val peer = async {
-            withTimeoutOrNull(6_000) { runCascade(app, options, events) }
-        }
-        for (evt in events) {
-            // Don't surface status updates during reconnect — the UI
-            // is allowed to look idle.
-            if (evt is CascadeEvent.Phase) continue
-        }
-        val p = peer.await() ?: return false
-        // Bring up TLS and check fingerprint.
-        return try {
-            val tls = TlsClient.dial(p.address, p.port)
-            val fp = tls.peerCertSha256
-            val match = known.firstOrNull { it.peerTlsCertSha256.contentEquals(fp) }
-            if (match != null) {
-                _state.value = PairingUiState.Paired(match.peerDeviceName)
-                true
-            } else {
-                tls.close()
+    private suspend fun tryReconnect(known: List<PairedPcStore.Entry>): Boolean =
+        kotlinx.coroutines.coroutineScope {
+            _state.value = PairingUiState.Status("cascade.mdns", allowManual = true)
+            val options = CascadeOptions(
+                localDeviceName = android.os.Build.MODEL ?: "Phone",
+                localDeviceType = "phone",
+                // Tighter timeouts for the silent path.
+                mdnsTimeoutMs = 3_000,
+                udpTimeoutMs = 1_500,
+            )
+            val events = Channel<CascadeEvent>(Channel.UNLIMITED)
+            val peerJob = async {
+                withTimeoutOrNull(6_000) { runCascade(app, options, events) }
+            }
+            for (evt in events) {
+                // Don't surface status updates during reconnect — the UI
+                // is allowed to look idle.
+                if (evt is CascadeEvent.Phase) continue
+            }
+            val p = peerJob.await() ?: return@coroutineScope false
+            // Bring up TLS and check fingerprint.
+            try {
+                val tls = TlsClient.dial(p.address, p.port)
+                val fp = tls.peerCertSha256
+                val match = known.firstOrNull { it.peerTlsCertSha256.contentEquals(fp) }
+                if (match != null) {
+                    _state.value = PairingUiState.Paired(match.peerDeviceName)
+                    true
+                } else {
+                    tls.close()
+                    false
+                }
+            } catch (_: Throwable) {
                 false
             }
-        } catch (_: Throwable) {
-            false
         }
-    }
 
     private suspend fun handshakeWith(
         host: String,
@@ -301,18 +302,22 @@ class PairingViewModel(
     private suspend fun race(
         userConfirmAwait: Boolean,
         peerRecv: suspend () -> Envelope?,
-    ): ConfirmEvent? {
-        // Re-entrant select; we want to listen on user channels AND
-        // on the websocket simultaneously. The select-on-channels API
-        // in kotlinx-coroutines does this cleanly.
-        return kotlinx.coroutines.selects.select {
-            if (userConfirmAwait) {
-                userConfirm.onReceive { ConfirmEvent.UserConfirm }
+    ): ConfirmEvent? = kotlinx.coroutines.coroutineScope {
+        // Re-entrant select. We want to listen on user channels AND
+        // on the websocket simultaneously. The peer recv has to run
+        // inside a child scope so its Deferred is awaitable from the
+        // select block; coroutineScope here gives us that.
+        val peerJob = async { peerRecv() }
+        try {
+            kotlinx.coroutines.selects.select {
+                if (userConfirmAwait) {
+                    userConfirm.onReceive { ConfirmEvent.UserConfirm as ConfirmEvent }
+                }
+                userMismatch.onReceive { ConfirmEvent.UserMismatch as ConfirmEvent }
+                peerJob.onAwait { env -> env?.let { ConfirmEvent.Peer(it) } }
             }
-            userMismatch.onReceive { ConfirmEvent.UserMismatch }
-            kotlinx.coroutines.GlobalScope.async { peerRecv() }.onAwait { env ->
-                env?.let { ConfirmEvent.Peer(it) }
-            }
+        } finally {
+            if (peerJob.isActive) peerJob.cancel()
         }
     }
 
