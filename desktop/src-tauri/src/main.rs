@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tether_core::{
-    discovery::{run_cascade, CascadeEvent, CascadeOptions},
+    discovery::{CascadeEvent, CascadeOptions},
     pairing::state::{PairingState, PairingUiEvent},
     store::Store,
 };
