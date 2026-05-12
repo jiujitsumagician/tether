@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- LAN discovery: mDNS multicast plus UDP broadcast/probe. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Required for mDNS/zeroconf service browsing on Android 13+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"
+        tools:targetApi="33" />
+    <!-- Foreground service used during pairing to keep the transport
+         alive if the user switches apps mid-confirm. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+        tools:targetApi="34" />
+
+    <queries>
+        <!-- For the USB fallback deep-link: launch developer-options
+             from the system settings package. -->
+        <intent>
+            <action android:name="android.settings.APPLICATION_DEVELOPMENT_SETTINGS" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Tether"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Tether"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Tether"
+            android:theme="@style/Theme.Tether">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ContentProvider used by the desktop USB fallback to push
+             a one-time pairing token over `adb shell content insert`. -->
+        <provider
+            android:name=".discovery.PairingTokenProvider"
+            android:authorities="io.tether.pairing"
+            android:enabled="true"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+    </application>
+</manifest>

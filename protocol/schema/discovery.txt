@@ -1,0 +1,106 @@
+Tether discovery wire format
+============================
+
+Three discovery channels share the same announcement payload but
+differ in how it is delivered. All payloads are plain ASCII / UTF-8
+key=value pairs because at least one of the channels (mDNS TXT) is
+constrained to short string fields.
+
+mDNS service
+------------
+
+Service type:  _tether._tcp.local.
+Default port:  31415 (TLS)
+Default UDP:   31413 (broadcast / probe)
+
+TXT keys (all values are short ASCII):
+
+  v        protocol version, currently "1"
+  t        device type — "pc" or "phone"
+  n        device name, UTF-8, <= 30 chars, RFC 6763 escaped if needed
+  p        TLS port (decimal string)
+  f        first 8 hex chars of TLS cert SHA-256 fingerprint
+
+Example TXT record:
+
+  v=1
+  t=pc
+  n=Mike's Laptop
+  p=31415
+  f=a3f2c1d4
+
+
+UDP broadcast (255.255.255.255:31413) + subnet probe (unicast)
+--------------------------------------------------------------
+
+Payload is newline-delimited key=value. The first line is a hard
+magic header so receivers can ignore unrelated UDP noise quickly.
+
+  TETHER1
+  type=announce
+  device_type=pc
+  device_name=Mike's Laptop
+  port=31415
+  cert_fp_short=a3f2c1d4
+  nonce=a1b2c3d4
+
+Key definitions:
+
+  TETHER1                     fixed magic; any packet not starting
+                              with this exact 8-byte sequence is
+                              dropped without further parsing.
+
+  type=announce               only message type for discovery. There
+                              is no "ack" or "request"; both sides
+                              broadcast continuously and the first
+                              packet either side sees that names a
+                              peer they don't already know triggers
+                              a TLS dial.
+
+  device_type=pc|phone        same as mDNS `t`.
+
+  device_name=<UTF-8>         same as mDNS `n`, <= 30 chars.
+
+  port=<decimal>              TLS port to dial.
+
+  cert_fp_short=<8 hex>       same as mDNS `f`. Used only as a
+                              de-duplication hint; full verification
+                              still happens in the handshake.
+
+  nonce=<8 hex>               randomized per packet so that a passive
+                              observer cannot fingerprint a stable
+                              identifier from broadcast traffic.
+
+Packets sent every 800ms during active discovery. The originator stops
+broadcasting the moment a TLS connection completes to or from any
+discovered peer.
+
+The subnet probe (phase 3) uses the same exact payload but sends each
+packet unicast to a /24 address. Receivers reply addressed back to the
+probe source with the same payload. A receiver MAY also independently
+broadcast on receipt — this catches networks that allow unicast but
+not multicast.
+
+Wire limits
+-----------
+
+Payload SHOULD fit in 500 bytes after the TETHER1 header. Realistic
+maximum given the field limits is ~200 bytes. Anything longer than
+1024 bytes is dropped without parsing.
+
+USB / ADB-over-cable
+--------------------
+
+No discovery payload over USB — the cable insertion IS the discovery
+event. The PC pushes a one-time pairing token via the bundled adb
+binary:
+
+  adb shell content insert \
+    --uri content://io.tether.pairing/token \
+    --bind token:s:<base64 url-safe random, 32 bytes> \
+    --bind port:i:31415
+
+The Android app's content provider receives the insert, then opens a
+TCP loopback connection to the bundled `adb reverse tcp:31415` tunnel.
+From that point onward the transport is the same TLS-over-TCP layer
+that wireless paths use.

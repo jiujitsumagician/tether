@@ -1,0 +1,219 @@
+/* Tether pairing UI. Single screen, one big state machine. */
+
+:root {
+  --bg: #0c0e14;
+  --surface: #161a25;
+  --surface-2: #1d2330;
+  --border: #262d3e;
+  --text: #f4f5f7;
+  --text-dim: #98a2b8;
+  --accent: #6c8cff;
+  --accent-hover: #87a3ff;
+  --danger: #f87171;
+  --success: #4ade80;
+  --radius: 18px;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f7fa;
+    --surface: #ffffff;
+    --surface-2: #f0f2f7;
+    --border: #e2e6ee;
+    --text: #0f172a;
+    --text-dim: #475569;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.screen {
+  width: 100%;
+  max-width: 440px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.screen h1 {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+  max-width: 22ch;
+}
+
+.screen .sub {
+  font-size: 15px;
+  color: var(--text-dim);
+  margin: 0;
+  max-width: 30ch;
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  vertical-align: -2px;
+  margin-right: 6px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  width: 100%;
+  max-width: 360px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.25);
+}
+
+.card .emojis {
+  font-size: 64px;
+  line-height: 1.1;
+  letter-spacing: 14px;
+  user-select: none;
+}
+
+.card .title {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.card .subhead {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0;
+  max-width: 26ch;
+  text-align: center;
+}
+
+.btn {
+  appearance: none;
+  border: none;
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  padding: 12px 28px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: var(--accent);
+  color: white;
+  transition: transform 0.05s ease, background 0.15s ease;
+}
+.btn:hover { background: var(--accent-hover); }
+.btn:active { transform: scale(0.98); }
+.btn:disabled {
+  background: var(--surface-2);
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  font-size: 13px;
+  padding: 6px 10px;
+  font-weight: 500;
+}
+
+.usb-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.usb-prompt .icon {
+  font-size: 56px;
+}
+
+.manual-link {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+}
+.manual-link:hover {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--surface);
+}
+
+.manual-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 360px;
+}
+.manual-form input {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+}
+.manual-form input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.error {
+  color: var(--danger);
+  font-size: 14px;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  padding: 10px 14px;
+  border-radius: 12px;
+  max-width: 30ch;
+}
+
+.success {
+  color: var(--success);
+  font-size: 22px;
+  font-weight: 600;
+}
