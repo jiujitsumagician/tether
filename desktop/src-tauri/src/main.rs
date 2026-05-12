@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tether_core::{
-    discovery::{CascadeEvent, CascadeOptions},
+    discovery::CascadeOptions,
     pairing::state::{PairingState, PairingUiEvent},
     store::Store,
 };
@@ -125,10 +125,3 @@ fn main() {
         .expect("Tether desktop failed to launch");
 }
 
-// Wire CascadeEvent through to the Tauri event channel for completeness
-// (used by integration tests that drive run_cascade directly without
-// the pairing state machine wrapper).
-#[allow(dead_code)]
-fn forward_cascade_event(app: &tauri::AppHandle, evt: CascadeEvent) {
-    let _ = app.emit("cascade", &evt);
-}

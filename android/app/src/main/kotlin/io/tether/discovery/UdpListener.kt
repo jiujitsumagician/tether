@@ -1,7 +1,10 @@
 package io.tether.discovery
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -27,6 +30,11 @@ object UdpListener {
 
             var lastSend = 0L
             while (true) {
+                // Cooperative cancellation: socket.receive is blocking
+                // I/O with no suspension boundary of its own, so we
+                // explicitly yield each loop so withTimeoutOrNull can
+                // actually time us out.
+                currentCoroutineContext().ensureActive()
                 val now = System.currentTimeMillis()
                 if (now - lastSend > 800) {
                     try { socket.send(outPacket) } catch (_: Throwable) {}
@@ -43,6 +51,7 @@ object UdpListener {
                     )
                     if (peer != null) return@withContext peer
                 } catch (_: java.net.SocketTimeoutException) {
+                    yield() // hand control back so cancellation can fire
                     continue
                 }
             }

@@ -212,6 +212,44 @@ html, body {
   max-width: 30ch;
 }
 
+.manual-display .manual-pin {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  max-width: 360px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+}
+.manual-pin-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.manual-pin-row .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+}
+.manual-pin-row .value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 22px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 10px 14px;
+  border-radius: 10px;
+  letter-spacing: 0.02em;
+}
+.manual-pin-row .value.pin {
+  font-size: 32px;
+  letter-spacing: 0.4em;
+  font-weight: 600;
+  text-align: center;
+}
+
 .success {
   color: var(--success);
   font-size: 22px;

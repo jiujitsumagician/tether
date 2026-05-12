@@ -1,18 +1,21 @@
 //! WebSocket-framed CBOR control channel.
 //!
-//! Sits on top of an established TLS stream. Each WebSocket text
+//! Sits on top of an established TLS stream. Each WebSocket binary
 //! frame carries one CBOR-encoded `Envelope<T>` from the handshake
-//! module.
+//! module. Generic over the underlying stream so the same channel
+//! type works for both the client (dial → TlsClient → upgrade) and
+//! server (accept → ServerTlsStream → from_accepted) paths.
 
 use super::tls::TlsClient;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-pub struct WsChannel {
-    inner: WebSocketStream<TlsClient>,
+pub struct WsChannel<S: AsyncRead + AsyncWrite + Unpin> {
+    inner: WebSocketStream<S>,
 }
 
 /// Raw envelope used when we don't yet know which body type to expect
@@ -27,7 +30,8 @@ pub struct RawEnvelope {
     pub body: Vec<u8>,
 }
 
-impl WsChannel {
+impl WsChannel<TlsClient> {
+    /// Client-side: dial → TLS → WS upgrade against /tether/v1.
     pub async fn upgrade(
         stream: TlsClient,
         pin: Option<&str>,
@@ -37,9 +41,16 @@ impl WsChannel {
             None => "/tether/v1".into(),
         };
         let request = format!("ws://tether.local{path}");
-        let (ws, _resp) =
-            tokio_tungstenite::client_async(request, stream).await?;
+        let (ws, _resp) = tokio_tungstenite::client_async(request, stream).await?;
         Ok(Self { inner: ws })
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> WsChannel<S> {
+    /// Server-side: take an already-upgraded WebSocketStream (the
+    /// listener has done the HTTP/1.1 upgrade dance) and wrap it.
+    pub fn from_accepted(ws: WebSocketStream<S>) -> Self {
+        Self { inner: ws }
     }
 
     pub async fn send_cbor<T: Serialize>(&mut self, env: &T) -> anyhow::Result<()> {

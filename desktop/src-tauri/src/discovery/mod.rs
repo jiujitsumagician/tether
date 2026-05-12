@@ -10,6 +10,7 @@
 //! Each phase emits `CascadeEvent`s on a channel; the pairing state
 //! machine picks the first `Found` and tears the cascade down.
 
+pub mod advertise;
 pub mod mdns;
 pub mod subnet_probe;
 pub mod udp_broadcast;

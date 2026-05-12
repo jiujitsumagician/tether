@@ -26,7 +26,7 @@ tauri-build = { version = "2", features = [], optional = true }
 # unit tests can build without pulling the WebView2 toolchain. Default
 # build (cargo build / cargo run) keeps `desktop` enabled so the bin
 # target compiles normally.
-tauri = { version = "2", optional = true }
+tauri = { version = "2", optional = true , features = [] }
 tauri-plugin-shell = { version = "2", optional = true }
 tauri-plugin-fs = { version = "2", optional = true }
 

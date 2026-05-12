@@ -15,6 +15,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, TlsStream};
 
+/// Type alias for the server-accepted TLS stream the listener
+/// produces. Wrapping the rustls server stream this way keeps the
+/// downstream `WsChannel`/handshake code stream-agnostic.
+pub type ServerTlsStream = TlsStream<TcpStream>;
+
 /// Lightweight wrapper around the post-TLS stream so the rest of the
 /// code only sees `AsyncRead + AsyncWrite + peer_cert_sha256()`.
 pub struct TlsClient {

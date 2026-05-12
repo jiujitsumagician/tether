@@ -1,53 +1,62 @@
-//! Pairing state machine — orchestrates the cascade, the TLS dial,
-//! the handshake, the verify/confirm dance, and persistence.
+//! Pairing state machine — PC side.
 //!
-//! Frontend talks to this through a handful of Tauri commands; events
-//! flow back through a single `pairing` event stream.
+//! The desktop's role is always the SERVER. We advertise our
+//! presence on the LAN (mDNS + UDP broadcast) and accept incoming
+//! TLS+WebSocket connections from the phone. When a phone dials in,
+//! we drive the handshake to confirmation and persist the pair.
+//!
+//! The phone is always the CLIENT and lives in the Android module —
+//! see `android/.../PairingViewModel.kt`.
 
 use super::{
     emoji_code,
-    handshake::{ConfirmBody, Envelope, HelloBody, MismatchBody, MismatchReason, VerifyBody, Handshake},
+    handshake::{
+        ConfirmBody, Envelope, Handshake, HelloBody, MismatchBody, MismatchReason, VerifyBody,
+    },
 };
 use crate::{
-    discovery::{run_cascade, CascadeEvent, CascadeOptions, DiscoveredPeer},
+    discovery::{
+        advertise::{advertise_mdns, advertise_udp, MdnsHandle},
+        CascadeOptions,
+    },
     store::{PairedDevice, Store},
-    transport::tls::TlsClient,
-    transport::ws::WsChannel,
+    transport::{
+        server::{serve, AcceptedClient},
+        tls::{cert_short_fp, own_cert_sha256},
+        ws::WsChannel,
+    },
 };
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 
-/// Everything the UI listens for on the `pairing` event channel.
-/// Keep this enum stable — the frontend switches on `kind`.
+/// Events emitted to the frontend on the `pairing` event channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PairingUiEvent {
     /// Cascade phase change. `key` is one of the cascade.* string IDs.
     StatusKey { key: String },
 
-    /// Pairing card ready to display. UI now shows the three emojis
-    /// and the Confirm button (disabled until peer confirms — but
-    /// the user can already tap; we record the local Confirm intent
-    /// and emit `Paired` once the peer's confirm arrives).
+    /// Pairing card ready. UI shows three emojis + Confirm button.
     Card {
         peer_device_name: String,
         emojis: [String; 3],
     },
 
-    /// Manual-entry escape hatch opened. Frontend renders the IP +
-    /// PIN form.
-    ManualEntryOpen,
+    /// Manual-entry escape hatch opened on the PC. Frontend renders
+    /// the PC's IP + 6-digit PIN so the user can type both on their
+    /// phone's "Pair another way" form.
+    ManualEntryPin { ip: String, pin: String },
 
     /// Successful pair.
     Paired { peer_device_name: String },
 
     /// Peer reported a mismatch (or our cross-check did).
     Mismatch { reason: String },
-
-    /// Cascade exhausted without finding a peer at all.
-    Exhausted,
 }
 
 pub struct PairingState {
@@ -58,13 +67,18 @@ pub struct PairingState {
 
 struct Inner {
     ui_tx: Option<mpsc::Sender<PairingUiEvent>>,
-    local_confirmed: bool,
-    peer_confirmed: bool,
-    peer_name: Option<String>,
-    /// Signals the handshake task that the user tapped Confirm.
+    /// Signals the active handshake task that the user tapped Confirm.
     user_confirmed: Arc<Notify>,
-    /// Signals the handshake task that the user reported a mismatch.
+    /// Signals the active handshake task that the user reported a mismatch.
     user_mismatch: Arc<Notify>,
+    /// Holds the mDNS daemon alive for the app's lifetime. Drop ⇒
+    /// unregister + shutdown.
+    _mdns: Option<MdnsHandle>,
+    /// 6-digit PIN currently displayed (or None if manual entry is
+    /// not currently open). The server-side WS upgrade requires this
+    /// PIN on `?pin=` whenever a client has come in via the manual
+    /// path.
+    manual_pin: Option<String>,
 }
 
 impl PairingState {
@@ -72,17 +86,18 @@ impl PairingState {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 ui_tx: None,
-                local_confirmed: false,
-                peer_confirmed: false,
-                peer_name: None,
                 user_confirmed: Arc::new(Notify::new()),
                 user_mismatch: Arc::new(Notify::new()),
+                _mdns: None,
+                manual_pin: None,
             })),
             options,
             store,
         }
     }
 
+    /// Start advertising + listening. Idempotent — calling twice in
+    /// a row just replaces the UI channel.
     pub async fn start(
         self: &Arc<Self>,
         ui_tx: mpsc::Sender<PairingUiEvent>,
@@ -90,126 +105,111 @@ impl PairingState {
         {
             let mut g = self.inner.lock().await;
             g.ui_tx = Some(ui_tx);
-            g.local_confirmed = false;
-            g.peer_confirmed = false;
-            g.peer_name = None;
+            // If we're being restarted, don't restart the listener
+            // and advertise tasks — they're already running. Just
+            // updating the UI sink is enough.
+            if g._mdns.is_some() {
+                return Ok(());
+            }
         }
 
-        // Spawn the cascade + handshake driver. We hand a clone to
-        // the task so it can still call `emit` on the error path
-        // after `run` consumes its Arc.
-        let me_run = Arc::clone(self);
-        let me_err = Arc::clone(self);
+        // Generate (or load) the TLS cert and stash its short
+        // fingerprint into the cascade options so mDNS / UDP
+        // announces include it.
+        let mut options = self.options.clone();
+        let local_cert = own_cert_sha256().await?;
+        options.local_cert_fp_short = cert_short_fp(&local_cert);
+
+        // mDNS service register — kept alive for the lifetime of
+        // the app via the MdnsHandle stored on Inner.
+        match advertise_mdns(&options) {
+            Ok(handle) => {
+                let mut g = self.inner.lock().await;
+                g._mdns = Some(handle);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "mDNS advertise failed: {e} — phone discovery falls back to UDP/probe/USB"
+                );
+            }
+        }
+
+        // UDP broadcast — keeps running until the process exits.
+        let udp_opts = options.clone();
         tokio::spawn(async move {
-            if let Err(e) = me_run.run().await {
-                tracing::warn!("pairing run failed: {e}");
-                let _ = me_err
-                    .emit(PairingUiEvent::Mismatch {
-                        reason: "protocol".into(),
-                    })
-                    .await;
+            if let Err(e) = advertise_udp(udp_opts).await {
+                tracing::warn!("UDP advertise loop exited: {e}");
             }
         });
-        Ok(())
-    }
 
-    pub async fn user_confirm(&self) -> anyhow::Result<()> {
-        let g = self.inner.lock().await;
-        g.user_confirmed.notify_one();
-        Ok(())
-    }
+        // TLS+WS listener. Every accepted client gets fed back here
+        // on the `incoming` channel; we run the server-side handshake
+        // per connection.
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<AcceptedClient>(8);
+        let bind_addr: SocketAddr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            options.local_tls_port,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = serve(bind_addr, incoming_tx).await {
+                tracing::error!("TLS listener exited: {e}");
+            }
+        });
 
-    pub async fn user_mismatch(&self) -> anyhow::Result<()> {
-        let g = self.inner.lock().await;
-        g.user_mismatch.notify_one();
-        Ok(())
-    }
-
-    pub async fn open_manual_entry(&self) -> anyhow::Result<()> {
-        self.emit(PairingUiEvent::ManualEntryOpen).await
-    }
-
-    pub async fn submit_manual(&self, address: String, pin: String) -> anyhow::Result<()> {
-        // The manual-entry path is intentionally minimal — produce a
-        // `DiscoveredPeer` from typed input and route through the
-        // same TLS+handshake code the cascade uses. The 6-digit PIN
-        // gates the transport via a server-side check; this stub
-        // forwards it as a TLS SNI hint so the server can validate
-        // against the PIN it's currently displaying.
-        let socket: std::net::SocketAddr = address.parse()?;
-        let peer = DiscoveredPeer {
-            device_type: "phone".into(),
-            device_name: format!("{}", socket),
-            socket,
-            cert_fp_short: String::new(),
-            via: crate::discovery::DiscoveryMethod::Manual,
-        };
-        // PIN is forwarded as part of the WS upgrade query string.
-        // Server validates and either accepts the upgrade or returns
-        // 401, which the WS client surfaces as an error here.
-        self.run_with_peer(peer, Some(pin)).await
-    }
-
-    pub async fn reset(&self) -> anyhow::Result<()> {
-        let mut g = self.inner.lock().await;
-        g.local_confirmed = false;
-        g.peer_confirmed = false;
-        g.peer_name = None;
-        Ok(())
-    }
-
-    async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        // Stream cascade events → UI status keys.
-        let (cascade_tx, mut cascade_rx) = mpsc::channel::<CascadeEvent>(32);
-        let me_for_events = Arc::clone(&self);
-        let event_pump = tokio::spawn(async move {
-            while let Some(evt) = cascade_rx.recv().await {
-                match evt {
-                    CascadeEvent::Phase { key } => {
-                        let _ = me_for_events
-                            .emit(PairingUiEvent::StatusKey { key })
-                            .await;
-                    }
-                    CascadeEvent::Exhausted => {
-                        let _ = me_for_events.emit(PairingUiEvent::Exhausted).await;
-                    }
-                    CascadeEvent::Found { .. } => {
-                        // The cascade also returns the peer via its
-                        // direct return path; here we only forward
-                        // the status updates.
-                    }
+        // Per-connection handler loop. One handshake at a time —
+        // pairing is a focused, user-driven act, not a server you
+        // multiplex.
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(client) = incoming_rx.recv().await {
+                if let Err(e) = me.handle_client(client).await {
+                    tracing::warn!("pairing handshake aborted: {e}");
+                    let _ = me
+                        .emit(PairingUiEvent::Mismatch {
+                            reason: "protocol".into(),
+                        })
+                        .await;
                 }
             }
         });
 
-        let peer = run_cascade(self.options.clone(), cascade_tx)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("cascade exhausted"))?;
-        event_pump.abort();
-
-        self.run_with_peer(peer, None).await
+        Ok(())
     }
 
-    /// Bring up TLS + WebSocket + handshake against a known peer. The
-    /// optional `pin` parameter is sent as a query-string token on
-    /// the WebSocket upgrade for the manual-entry path.
-    async fn run_with_peer(
+    /// Drive the handshake with one accepted client end-to-end.
+    async fn handle_client(&self, client: AcceptedClient) -> anyhow::Result<()> {
+        // PIN gate (only when the manual-entry path is currently
+        // open). Cleartext compare is fine — the PIN is a throw-away
+        // 6-digit value displayed on screen.
+        {
+            let g = self.inner.lock().await;
+            if let Some(expected) = g.manual_pin.as_ref() {
+                match client.pin.as_ref() {
+                    Some(got) if got == expected => {}
+                    _ => {
+                        anyhow::bail!("incoming client missing or wrong PIN");
+                    }
+                }
+            }
+        }
+
+        let mut ws = WsChannel::from_accepted(client.ws);
+        let local_cert_fp = own_cert_sha256().await?;
+        self.drive_handshake(&mut ws, local_cert_fp).await
+    }
+
+    /// Generic handshake driver shared by server and (future) client
+    /// paths. Sends hello, receives hello, derives verifier, sends
+    /// verify, receives verify, surfaces card, waits for both
+    /// confirms, persists.
+    async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &self,
-        peer: DiscoveredPeer,
-        pin: Option<String>,
+        ws: &mut WsChannel<S>,
+        local_cert_fp: Vec<u8>,
     ) -> anyhow::Result<()> {
-        // 1. TLS-dial.
-        let tls = TlsClient::dial(&peer.socket, &peer.cert_fp_short).await?;
-        let peer_cert_fp = tls.peer_cert_sha256().to_vec();
-
-        // 2. WebSocket upgrade. The pin (if any) goes as ?pin=...
-        let mut ws = WsChannel::upgrade(tls, pin.as_deref()).await?;
-
-        // 3. Send hello.
+        // 1. hello (send ours)
         let handshake = Handshake::new();
         let local_pub = handshake.local_pub.as_bytes().to_vec();
-        let local_cert_fp = crate::transport::tls::own_cert_sha256().await?;
-
         let hello = Envelope {
             v: crate::TETHER_PROTOCOL_VERSION,
             kind: "hello".into(),
@@ -225,7 +225,7 @@ impl PairingState {
         };
         ws.send_cbor(&hello).await?;
 
-        // 4. Receive peer hello.
+        // 2. hello (receive theirs)
         let peer_hello: Envelope<HelloBody> = ws
             .recv_cbor()
             .await?
@@ -234,18 +234,7 @@ impl PairingState {
             return Err(anyhow::anyhow!("protocol version mismatch"));
         }
 
-        // Cross-check the cert fingerprint TLS gave us against what
-        // the peer reports.
-        if peer_hello.body.tls_cert_sha256 != peer_cert_fp {
-            self.emit(PairingUiEvent::Mismatch {
-                reason: "protocol".into(),
-            })
-            .await
-            .ok();
-            return Err(anyhow::anyhow!("peer cert fp mismatch (MITM?)"));
-        }
-
-        // 5. Derive verifier, send + receive verify.
+        // 3. derive verifier
         let verifier = handshake.derive(&peer_hello.body.ecdh_pubkey)?;
         let indices = emoji_code::indices_from_verifier(&verifier);
         let emojis_static = emoji_code::from_verifier(&verifier);
@@ -255,6 +244,7 @@ impl PairingState {
             emojis_static[2].to_string(),
         ];
 
+        // 4. verify (send ours)
         let verify_msg = Envelope {
             v: 1,
             kind: "verify".into(),
@@ -268,6 +258,7 @@ impl PairingState {
         };
         ws.send_cbor(&verify_msg).await?;
 
+        // 5. verify (receive theirs) + cross-check
         let peer_verify: Envelope<VerifyBody> = ws
             .recv_cbor()
             .await?
@@ -281,39 +272,26 @@ impl PairingState {
             return Err(anyhow::anyhow!("peer verifier cross-check failed"));
         }
 
-        // 6. Surface the pairing card to the user. From here we wait
-        //    for BOTH the local user's confirm tap AND the peer's
-        //    confirm message before persisting.
+        // 6. Card → wait for both confirms (60 s)
         self.emit(PairingUiEvent::Card {
             peer_device_name: peer_verify.body.device_name.clone(),
             emojis,
         })
         .await?;
 
-        let user_confirmed = {
+        let (user_confirmed, user_mismatch) = {
             let g = self.inner.lock().await;
-            g.user_confirmed.clone()
-        };
-        let user_mismatch = {
-            let g = self.inner.lock().await;
-            g.user_mismatch.clone()
+            (g.user_confirmed.clone(), g.user_mismatch.clone())
         };
 
-        // Wait up to 60s for both sides to confirm (or for either
-        // side to report a mismatch).
-        let result = timeout(Duration::from_secs(60), async {
-            // Spawn a peer-reader because we need to listen on the WS
-            // while simultaneously waiting on user input.
+        let confirm_result = timeout(Duration::from_secs(60), async {
             let mut peer_confirm_received = false;
             let mut local_confirm_sent = false;
-
             loop {
                 tokio::select! {
                     _ = user_confirmed.notified(), if !local_confirm_sent => {
                         let confirm = Envelope {
-                            v: 1,
-                            kind: "confirm".into(),
-                            id: 3,
+                            v: 1, kind: "confirm".into(), id: 3,
                             in_reply_to: Some(peer_verify.id),
                             body: ConfirmBody { confirmed: true },
                         };
@@ -323,9 +301,7 @@ impl PairingState {
                     }
                     _ = user_mismatch.notified() => {
                         let m = Envelope {
-                            v: 1,
-                            kind: "mismatch".into(),
-                            id: 4,
+                            v: 1, kind: "mismatch".into(), id: 4,
                             in_reply_to: Some(peer_verify.id),
                             body: MismatchBody {
                                 reason: MismatchReason::UserMismatch.wire().into(),
@@ -346,7 +322,7 @@ impl PairingState {
                                 return Err(anyhow::anyhow!("peer mismatch: {}", mb.reason));
                             }
                             Some(env) => {
-                                tracing::warn!("unexpected message: {}", env.kind);
+                                tracing::warn!("unexpected message during confirm: {}", env.kind);
                             }
                             None => return Err(anyhow::anyhow!("peer closed during confirm")),
                         }
@@ -357,7 +333,7 @@ impl PairingState {
         })
         .await;
 
-        match result {
+        match confirm_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 self.emit(PairingUiEvent::Mismatch {
@@ -369,9 +345,7 @@ impl PairingState {
             }
             Err(_) => {
                 let m = Envelope {
-                    v: 1,
-                    kind: "mismatch".into(),
-                    id: 5,
+                    v: 1, kind: "mismatch".into(), id: 5,
                     in_reply_to: None,
                     body: MismatchBody {
                         reason: MismatchReason::Timeout.wire().into(),
@@ -387,20 +361,71 @@ impl PairingState {
             }
         }
 
-        // 7. Persist.
+        // 7. Persist + close out manual entry if it was open.
         let device = PairedDevice {
             peer_device_type: peer_hello.body.device_type.clone(),
             peer_device_name: peer_verify.body.device_name.clone(),
             peer_x25519_pubkey: peer_hello.body.ecdh_pubkey.clone(),
-            peer_tls_cert_sha256: peer_cert_fp.clone(),
-            paired_at: chrono_secs_since_epoch(),
+            // Server side: we never received the peer's TLS cert
+            // because we never asked for client certs during initial
+            // pair. We persist what the peer told us in hello;
+            // mutual-TLS reconnect will require the phone to present
+            // a cert whose SHA-256 matches.
+            peer_tls_cert_sha256: peer_hello.body.tls_cert_sha256.clone(),
+            paired_at: now_secs(),
         };
         self.store.add_paired(device).await?;
+
+        {
+            let mut g = self.inner.lock().await;
+            g.manual_pin = None;
+        }
+
         self.emit(PairingUiEvent::Paired {
             peer_device_name: peer_verify.body.device_name,
         })
         .await
         .ok();
+        Ok(())
+    }
+
+    pub async fn user_confirm(&self) -> anyhow::Result<()> {
+        let g = self.inner.lock().await;
+        g.user_confirmed.notify_one();
+        Ok(())
+    }
+
+    pub async fn user_mismatch(&self) -> anyhow::Result<()> {
+        let g = self.inner.lock().await;
+        g.user_mismatch.notify_one();
+        Ok(())
+    }
+
+    /// "Pair another way" on the PC: generate a 6-digit PIN, store
+    /// it, and tell the UI to display IP + PIN so the user can type
+    /// both on their phone.
+    pub async fn open_manual_entry(&self) -> anyhow::Result<()> {
+        let pin = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
+        {
+            let mut g = self.inner.lock().await;
+            g.manual_pin = Some(pin.clone());
+        }
+        let ip = local_v4_address()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<your-pc>".into());
+        self.emit(PairingUiEvent::ManualEntryPin { ip, pin }).await
+    }
+
+    /// PC has no manual-entry "submit" — the phone submits and dials
+    /// the listener. Kept as a no-op so the Tauri command surface
+    /// stays stable for older frontends.
+    pub async fn submit_manual(&self, _address: String, _pin: String) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub async fn reset(&self) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().await;
+        g.manual_pin = None;
         Ok(())
     }
 
@@ -413,9 +438,25 @@ impl PairingState {
     }
 }
 
-fn chrono_secs_since_epoch() -> u64 {
+fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Best-effort first non-loopback IPv4 address on this host. Used
+/// by the manual-entry display. Cheap trick: open a UDP "connection"
+/// to a public address — the OS picks the egress interface, then we
+/// read the bound local addr. No packets actually leave the box.
+fn local_v4_address() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let addr = sock.local_addr().ok()?;
+    if let std::net::IpAddr::V4(v4) = addr.ip() {
+        if !v4.is_loopback() {
+            return Some(v4);
+        }
+    }
+    None
 }

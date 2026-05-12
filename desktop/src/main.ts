@@ -8,10 +8,9 @@ import { t } from "./ui/strings";
 type PairingEvent =
   | { kind: "status_key"; key: string }
   | { kind: "card"; peer_device_name: string; emojis: [string, string, string] }
-  | { kind: "manual_entry_open" }
+  | { kind: "manual_entry_pin"; ip: string; pin: string }
   | { kind: "paired"; peer_device_name: string }
-  | { kind: "mismatch"; reason: string }
-  | { kind: "exhausted" };
+  | { kind: "mismatch"; reason: string };
 
 const root = document.getElementById("screen")!;
 const manualLink = document.getElementById("pair-another-way")!;
@@ -169,53 +168,39 @@ function renderMismatch(reason: string) {
   root.appendChild(btn);
 }
 
-function renderExhausted() {
-  clear();
-  manualLink.hidden = false;
-  const wrap = document.createElement("div");
-  wrap.className = "screen";
-  const h1 = document.createElement("h1");
-  h1.textContent =
-    "We can't see your phone from this network. Plug in a USB cable to finish setup.";
-  wrap.appendChild(h1);
-  const btn = document.createElement("button");
-  btn.className = "btn";
-  btn.textContent = "Try again";
-  btn.addEventListener("click", () => {
-    renderIdle();
-    invoke("reset_pairing").then(() => invoke("start_pairing"));
-  });
-  wrap.appendChild(btn);
-  root.appendChild(wrap);
-}
 
-function renderManualForm() {
+function renderManualPin(ip: string, pin: string) {
   clear();
+  manualLink.hidden = true;
   const wrap = document.createElement("div");
-  wrap.className = "screen";
+  wrap.className = "screen manual-display";
   const h1 = document.createElement("h1");
-  h1.textContent = "Pair another way";
+  h1.textContent = "Type this on your phone";
   const sub = document.createElement("p");
   sub.className = "sub";
   sub.textContent =
-    "Enter your PC's address and the 6-digit code shown on screen.";
+    "Open the phone's Tether app, tap “Pair another way”, and enter:";
   wrap.append(h1, sub);
-  const form = document.createElement("form");
-  form.className = "manual-form";
-  form.innerHTML = `
-    <input name="address" placeholder="192.168.1.42:31415" autocomplete="off" required />
-    <input name="pin" placeholder="6-digit code" inputmode="numeric" maxlength="6" required />
-    <button class="btn" type="submit">Pair</button>
-  `;
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const fd = new FormData(form);
-    await invoke("submit_manual", {
-      address: String(fd.get("address") ?? ""),
-      pin: String(fd.get("pin") ?? ""),
-    });
+
+  const block = document.createElement("div");
+  block.className = "manual-pin";
+  const ipRow = document.createElement("div");
+  ipRow.className = "manual-pin-row";
+  ipRow.innerHTML = `<span class="label">PC address</span><code class="value">${ip}</code>`;
+  const pinRow = document.createElement("div");
+  pinRow.className = "manual-pin-row";
+  pinRow.innerHTML = `<span class="label">6-digit code</span><code class="value pin">${pin}</code>`;
+  block.append(ipRow, pinRow);
+  wrap.appendChild(block);
+
+  const cancel = document.createElement("button");
+  cancel.className = "btn btn-danger";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", async () => {
+    await invoke("reset_pairing");
+    renderIdle();
   });
-  wrap.appendChild(form);
+  wrap.appendChild(cancel);
   root.appendChild(wrap);
 }
 
@@ -232,17 +217,14 @@ async function bootstrap() {
       case "card":
         renderCard(data.peer_device_name, data.emojis);
         break;
-      case "manual_entry_open":
-        renderManualForm();
+      case "manual_entry_pin":
+        renderManualPin(data.ip, data.pin);
         break;
       case "paired":
         renderPaired(data.peer_device_name);
         break;
       case "mismatch":
         renderMismatch(data.reason);
-        break;
-      case "exhausted":
-        renderExhausted();
         break;
     }
   });

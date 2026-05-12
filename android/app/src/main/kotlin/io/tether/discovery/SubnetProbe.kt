@@ -5,8 +5,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -28,11 +31,14 @@ object SubnetProbe {
         val payload = UdpListener.buildAnnounce(options)
         try {
             // Listener — break out the moment we get any non-self
-            // response.
+            // response. Yields on every iteration so the surrounding
+            // withTimeoutOrNull can actually cancel us at the phase
+            // deadline.
             val listener = async {
                 val buf = ByteArray(1024)
                 val inPacket = DatagramPacket(buf, buf.size)
                 while (true) {
+                    currentCoroutineContext().ensureActive()
                     socket.soTimeout = 200
                     try {
                         socket.receive(inPacket)
@@ -42,7 +48,10 @@ object SubnetProbe {
                             options.localDeviceType,
                         )
                         if (peer != null) return@async peer
-                    } catch (_: java.net.SocketTimeoutException) { continue }
+                    } catch (_: java.net.SocketTimeoutException) {
+                        yield()
+                        continue
+                    }
                     catch (_: Throwable) { return@async null }
                 }
                 @Suppress("UNREACHABLE_CODE") null
