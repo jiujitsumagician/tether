@@ -250,6 +250,47 @@ html, body {
   text-align: center;
 }
 
+.firewall-warn {
+  margin-top: 18px;
+  max-width: 380px;
+  background: rgba(248, 113, 113, 0.08);
+  border: 1px solid rgba(248, 113, 113, 0.30);
+  border-radius: var(--radius);
+  padding: 18px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.firewall-warn strong {
+  color: var(--text);
+  font-size: 14px;
+}
+.firewall-warn p {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin: 0;
+  line-height: 1.4;
+}
+.firewall-warn .btn {
+  align-self: flex-start;
+  padding: 8px 18px;
+  font-size: 14px;
+}
+.firewall-warn .firewall-fallback {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  word-break: break-all;
+}
+.firewall-warn .firewall-fallback code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
 .success {
   color: var(--success);
   font-size: 22px;

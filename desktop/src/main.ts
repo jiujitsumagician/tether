@@ -7,10 +7,17 @@ import { t } from "./ui/strings";
 
 type PairingEvent =
   | { kind: "status_key"; key: string }
+  | { kind: "listening"; ip: string; port: number; firewall_ok: boolean }
   | { kind: "card"; peer_device_name: string; emojis: [string, string, string] }
   | { kind: "manual_entry_pin"; ip: string; pin: string }
   | { kind: "paired"; peer_device_name: string }
   | { kind: "mismatch"; reason: string };
+
+// Most recent listener state, populated by the `listening` event.
+// Used by renderIdle so the user always sees what IP+port the server
+// is bound to and whether the firewall is letting traffic through.
+let listenerState: { ip: string; port: number; firewall_ok: boolean } | null =
+  null;
 
 const root = document.getElementById("screen")!;
 const manualLink = document.getElementById("pair-another-way")!;
@@ -24,6 +31,50 @@ function renderIdle() {
   const h1 = document.createElement("h1");
   h1.textContent = t("home.pc.idle");
   root.appendChild(h1);
+
+  if (listenerState) {
+    const { ip, port, firewall_ok } = listenerState;
+    if (firewall_ok) {
+      const note = document.createElement("p");
+      note.className = "sub";
+      note.textContent = `Listening on ${ip}:${port}.`;
+      root.appendChild(note);
+    } else {
+      const warn = document.createElement("div");
+      warn.className = "firewall-warn";
+      warn.innerHTML = `
+        <strong>Windows Firewall is blocking incoming connections.</strong>
+        <p>Your phone won't be able to reach this PC until you allow Tether through the firewall. We can fix that with one click — you'll see a UAC prompt.</p>
+      `;
+      const btn = document.createElement("button");
+      btn.className = "btn";
+      btn.textContent = "Allow in Firewall";
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Asking Windows…";
+        try {
+          await invoke("fix_firewall_windows");
+          btn.textContent = "Fixed. Re-checking…";
+          // Force a re-probe by restarting the listener-status path.
+          setTimeout(() => location.reload(), 1200);
+        } catch (e) {
+          btn.disabled = false;
+          btn.textContent = "Allow in Firewall";
+          const err = document.createElement("p");
+          err.className = "error";
+          err.textContent = String(e);
+          warn.appendChild(err);
+        }
+      });
+      warn.appendChild(btn);
+      const small = document.createElement("p");
+      small.className = "firewall-fallback";
+      small.innerHTML = `Prefer to do it yourself? Open PowerShell as Administrator and run: <code>New-NetFirewallRule -DisplayName "Tether (TCP listener)" -Direction Inbound -Protocol TCP -LocalPort ${port} -Action Allow -Profile Any</code>`;
+      warn.appendChild(small);
+      root.appendChild(warn);
+    }
+  }
+
   manualLink.hidden = false;
 }
 
@@ -213,6 +264,12 @@ async function bootstrap() {
     switch (data.kind) {
       case "status_key":
         renderStatus(data.key);
+        break;
+      case "listening":
+        listenerState = { ip: data.ip, port: data.port, firewall_ok: data.firewall_ok };
+        // Re-render idle so the listening line / firewall warning
+        // shows up the moment we know the state.
+        renderIdle();
         break;
       case "card":
         renderCard(data.peer_device_name, data.emojis);

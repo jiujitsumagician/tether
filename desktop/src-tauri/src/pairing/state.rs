@@ -41,6 +41,20 @@ pub enum PairingUiEvent {
     /// Cascade phase change. `key` is one of the cascade.* string IDs.
     StatusKey { key: String },
 
+    /// Server bound and advertising. Surface the IP+port on the
+    /// idle screen so the user can verify the listener is up — and
+    /// so they have something to type into the phone's manual-entry
+    /// form if they need to.
+    Listening {
+        ip: String,
+        port: u16,
+        /// True if a freshly-spawned localhost probe to (ip, port)
+        /// succeeded right after binding. False usually means the
+        /// listener bound but the OS firewall is dropping inbound
+        /// traffic — the only realistic culprit on Windows.
+        firewall_ok: bool,
+    },
+
     /// Pairing card ready. UI shows three emojis + Confirm button.
     Card {
         peer_device_name: String,
@@ -154,6 +168,28 @@ impl PairingState {
             if let Err(e) = serve(bind_addr, incoming_tx).await {
                 tracing::error!("TLS listener exited: {e}");
             }
+        });
+
+        // Self-diagnose: wait a beat for the listener to actually
+        // bind, then probe localhost + LAN-IP. Surface the result so
+        // the home screen can show "Listening on 192.168.x.y:31415"
+        // (and tell the user when the firewall is silently dropping
+        // inbound traffic).
+        let me_diag = Arc::clone(self);
+        let port = options.local_tls_port;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let ip = local_v4_address()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "<your-pc>".into());
+            let firewall_ok = probe_listener(port).await;
+            let _ = me_diag
+                .emit(PairingUiEvent::Listening {
+                    ip,
+                    port,
+                    firewall_ok,
+                })
+                .await;
         });
 
         // Per-connection handler loop. One handshake at a time —
@@ -459,4 +495,25 @@ fn local_v4_address() -> Option<std::net::Ipv4Addr> {
         }
     }
     None
+}
+
+/// Probe whether the TLS listener is actually reachable from
+/// outside-the-process. We TCP-connect to our own LAN IP (not
+/// 127.0.0.1, which always works regardless of firewall) and look
+/// for either "connected" or "refused" — anything other than "we
+/// got there" means a firewall is dropping our inbound port.
+async fn probe_listener(port: u16) -> bool {
+    let ip = match local_v4_address() {
+        Some(v) => v,
+        None => return false,
+    };
+    let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }

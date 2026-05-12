@@ -78,6 +78,36 @@ async fn list_paired(state: State<'_, AppState>) -> Result<serde_json::Value, St
     serde_json::to_value(pairs).map_err(|e| e.to_string())
 }
 
+/// Spawn an elevated PowerShell that adds the Windows Firewall rules
+/// for the TLS listener (TCP/31415) + UDP discovery (31413). The
+/// user gets a UAC prompt — they click Yes — done forever.
+///
+/// No-op on non-Windows targets.
+#[tauri::command]
+async fn fix_firewall_windows() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // We chain the two New-NetFirewallRule calls + an
+        // Invoke-Expression so a single UAC prompt covers both
+        // rules. -ErrorAction SilentlyContinue swallows the
+        // "rule already exists" case so the user can click
+        // "Allow firewall" twice without seeing an error.
+        let cmd = "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',\"New-NetFirewallRule -DisplayName 'Tether (TCP listener)' -Direction Inbound -Protocol TCP -LocalPort 31415 -Action Allow -Profile Any -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName 'Tether (UDP discovery)' -Direction Inbound -Protocol UDP -LocalPort 31413 -Action Allow -Profile Any -ErrorAction SilentlyContinue\"";
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", cmd])
+            .status()
+            .map_err(|e| format!("failed to spawn elevated PowerShell: {e}"))?;
+        if !status.success() {
+            return Err(format!("elevated PowerShell exited {status}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("firewall fix is Windows-only".into())
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -120,6 +150,7 @@ fn main() {
             submit_manual,
             reset_pairing,
             list_paired,
+            fix_firewall_windows,
         ])
         .run(tauri::generate_context!())
         .expect("Tether desktop failed to launch");
