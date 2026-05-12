@@ -53,6 +53,9 @@ pub enum PairingUiEvent {
         /// listener bound but the OS firewall is dropping inbound
         /// traffic — the only realistic culprit on Windows.
         firewall_ok: bool,
+        /// Absolute path to run.log so the user can paste it back
+        /// when pairing fails. Filled by main.rs at startup.
+        log_path: String,
     },
 
     /// Pairing card ready. UI shows three emojis + Confirm button.
@@ -183,11 +186,18 @@ impl PairingState {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "<your-pc>".into());
             let firewall_ok = probe_listener(port).await;
+            let log_path = dirs::data_local_dir()
+                .map(|d| d.join("tether").join("run.log").to_string_lossy().into_owned())
+                .unwrap_or_else(|| "run.log".into());
+            tracing::info!(
+                "diagnostic: listening on {ip}:{port}, firewall_ok={firewall_ok}, log_path={log_path}"
+            );
             let _ = me_diag
                 .emit(PairingUiEvent::Listening {
                     ip,
                     port,
                     firewall_ok,
+                    log_path,
                 })
                 .await;
         });
@@ -214,6 +224,8 @@ impl PairingState {
 
     /// Drive the handshake with one accepted client end-to-end.
     async fn handle_client(&self, client: AcceptedClient) -> anyhow::Result<()> {
+        let peer_addr = client.peer_addr;
+        tracing::info!("starting handshake with {peer_addr}");
         // PIN gate (only when the manual-entry path is currently
         // open). Cleartext compare is fine — the PIN is a throw-away
         // 6-digit value displayed on screen.
@@ -221,8 +233,11 @@ impl PairingState {
             let g = self.inner.lock().await;
             if let Some(expected) = g.manual_pin.as_ref() {
                 match client.pin.as_ref() {
-                    Some(got) if got == expected => {}
+                    Some(got) if got == expected => {
+                        tracing::info!("{peer_addr} supplied correct PIN");
+                    }
                     _ => {
+                        tracing::warn!("{peer_addr} missing/wrong PIN; rejecting");
                         anyhow::bail!("incoming client missing or wrong PIN");
                     }
                 }
@@ -231,7 +246,12 @@ impl PairingState {
 
         let mut ws = WsChannel::from_accepted(client.ws);
         let local_cert_fp = own_cert_sha256().await?;
-        self.drive_handshake(&mut ws, local_cert_fp).await
+        let result = self.drive_handshake(&mut ws, local_cert_fp).await;
+        match &result {
+            Ok(()) => tracing::info!("handshake with {peer_addr} reached paired state"),
+            Err(e) => tracing::warn!("handshake with {peer_addr} failed: {e:#}"),
+        }
+        result
     }
 
     /// Generic handshake driver shared by server and (future) client
@@ -260,14 +280,24 @@ impl PairingState {
             },
         };
         ws.send_cbor(&hello).await?;
+        tracing::debug!("sent hello");
 
         // 2. hello (receive theirs)
         let peer_hello: Envelope<HelloBody> = ws
             .recv_cbor()
             .await?
             .ok_or_else(|| anyhow::anyhow!("connection closed before peer hello"))?;
+        tracing::info!(
+            "received hello from {} ({})",
+            peer_hello.body.device_name,
+            peer_hello.body.device_type
+        );
         if peer_hello.body.protocol_version != 1 || peer_hello.v != 1 {
-            return Err(anyhow::anyhow!("protocol version mismatch"));
+            return Err(anyhow::anyhow!(
+                "protocol version mismatch (peer v={}, body protocol_version={})",
+                peer_hello.v,
+                peer_hello.body.protocol_version
+            ));
         }
 
         // 3. derive verifier
@@ -293,6 +323,7 @@ impl PairingState {
             },
         };
         ws.send_cbor(&verify_msg).await?;
+        tracing::debug!("sent verify (emoji indices: {:?})", indices);
 
         // 5. verify (receive theirs) + cross-check
         let peer_verify: Envelope<VerifyBody> = ws
@@ -300,6 +331,7 @@ impl PairingState {
             .await?
             .ok_or_else(|| anyhow::anyhow!("connection closed before peer verify"))?;
         if peer_verify.body.fingerprint != verifier.to_vec() {
+            tracing::warn!("peer verifier disagrees — aborting (MITM?)");
             self.emit(PairingUiEvent::Mismatch {
                 reason: "protocol".into(),
             })
@@ -307,6 +339,7 @@ impl PairingState {
             .ok();
             return Err(anyhow::anyhow!("peer verifier cross-check failed"));
         }
+        tracing::info!("verifier agreement: emoji indices match peer's");
 
         // 6. Card → wait for both confirms (60 s)
         self.emit(PairingUiEvent::Card {
@@ -314,6 +347,7 @@ impl PairingState {
             emojis,
         })
         .await?;
+        tracing::info!("pairing card shown — waiting for both confirms");
 
         let (user_confirmed, user_mismatch) = {
             let g = self.inner.lock().await;

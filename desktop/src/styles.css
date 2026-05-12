@@ -291,6 +291,21 @@ html, body {
   color: var(--text);
 }
 
+.log-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 12px;
+  max-width: 38ch;
+  word-break: break-all;
+}
+.log-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
 .success {
   color: var(--success);
   font-size: 22px;

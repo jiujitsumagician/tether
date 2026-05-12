@@ -61,7 +61,7 @@ fun HomeScreen(vm: PairingViewModel) {
                 vm.submitManual(addr, pin)
             })
             is PairingUiState.Paired -> PairedView(s.peerName)
-            is PairingUiState.Mismatch -> MismatchView(s.reason, onRetry = vm::restart)
+            is PairingUiState.Mismatch -> MismatchView(s.reason, s.detail, onRetry = vm::restart)
             is PairingUiState.Exhausted -> ExhaustedView(onRetry = vm::restart, onManual = vm::openManualEntry)
         }
     }
@@ -241,10 +241,10 @@ private fun PairedView(peerName: String) {
 }
 
 @Composable
-private fun MismatchView(reason: String, onRetry: () -> Unit) {
+private fun MismatchView(reason: String, detail: String?, onRetry: () -> Unit) {
     val msg = when (reason) {
         "timeout" -> "We waited but no one confirmed. Try again from both apps."
-        "protocol" -> "Something didn't add up about the other device. Try again."
+        "protocol" -> "Couldn't talk to your computer. The exact error is shown below."
         else -> Strings.PairMismatch
     }
     Column(
@@ -253,6 +253,15 @@ private fun MismatchView(reason: String, onRetry: () -> Unit) {
         modifier = Modifier.padding(24.dp),
     ) {
         Text(msg, color = Color(0xFFF87171), fontSize = 16.sp, textAlign = TextAlign.Center)
+        if (!detail.isNullOrBlank()) {
+            Text(
+                detail,
+                color = TextDim,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 12.dp),
+            )
+        }
         Button(onClick = onRetry, colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
             Text("Try again", color = Color.White)
         }

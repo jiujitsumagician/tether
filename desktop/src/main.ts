@@ -7,7 +7,7 @@ import { t } from "./ui/strings";
 
 type PairingEvent =
   | { kind: "status_key"; key: string }
-  | { kind: "listening"; ip: string; port: number; firewall_ok: boolean }
+  | { kind: "listening"; ip: string; port: number; firewall_ok: boolean; log_path: string }
   | { kind: "card"; peer_device_name: string; emojis: [string, string, string] }
   | { kind: "manual_entry_pin"; ip: string; pin: string }
   | { kind: "paired"; peer_device_name: string }
@@ -15,9 +15,11 @@ type PairingEvent =
 
 // Most recent listener state, populated by the `listening` event.
 // Used by renderIdle so the user always sees what IP+port the server
-// is bound to and whether the firewall is letting traffic through.
-let listenerState: { ip: string; port: number; firewall_ok: boolean } | null =
-  null;
+// is bound to, whether the firewall is letting traffic through, and
+// where the run log lives so they can paste it when pairing fails.
+let listenerState:
+  | { ip: string; port: number; firewall_ok: boolean; log_path: string }
+  | null = null;
 
 const root = document.getElementById("screen")!;
 const manualLink = document.getElementById("pair-another-way")!;
@@ -33,12 +35,16 @@ function renderIdle() {
   root.appendChild(h1);
 
   if (listenerState) {
-    const { ip, port, firewall_ok } = listenerState;
+    const { ip, port, firewall_ok, log_path } = listenerState;
     if (firewall_ok) {
       const note = document.createElement("p");
       note.className = "sub";
       note.textContent = `Listening on ${ip}:${port}.`;
       root.appendChild(note);
+      const logHint = document.createElement("p");
+      logHint.className = "log-hint";
+      logHint.innerHTML = `If pairing still fails, the full run log is at <code>${log_path}</code>.`;
+      root.appendChild(logHint);
     } else {
       const warn = document.createElement("div");
       warn.className = "firewall-warn";
@@ -266,7 +272,12 @@ async function bootstrap() {
         renderStatus(data.key);
         break;
       case "listening":
-        listenerState = { ip: data.ip, port: data.port, firewall_ok: data.firewall_ok };
+        listenerState = {
+          ip: data.ip,
+          port: data.port,
+          firewall_ok: data.firewall_ok,
+          log_path: data.log_path,
+        };
         // Re-render idle so the listening line / firewall warning
         // shows up the moment we know the state.
         renderIdle();

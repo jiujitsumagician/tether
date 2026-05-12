@@ -109,12 +109,35 @@ async fn fix_firewall_windows() -> Result<(), String> {
 }
 
 fn main() {
+    // File-backed logging so the user can paste the run log when
+    // pairing fails. The file lives next to the cert + paired store
+    // under dirs::data_local_dir()/tether/run.log. Console output
+    // ALSO goes there because it's a single subscriber.
+    let log_dir = dirs::data_local_dir()
+        .map(|d| d.join("tether"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::never(&log_dir, "run.log");
+    // _guard MUST stay alive for the lifetime of the process; if it
+    // drops, the writer thread shuts down and logs disappear.
+    let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    Box::leak(Box::new(_guard));
+
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "tether_core=debug,tether_desktop=debug".into());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tether_core=info,tether_desktop=info".into()),
-        )
+        .with_env_filter(filter)
+        .with_writer(file_writer.and(std::io::stderr))
+        .with_target(true)
+        .with_thread_ids(false)
         .init();
+
+    tracing::info!(
+        "tether-desktop {} starting; log file at {}",
+        env!("CARGO_PKG_VERSION"),
+        log_dir.join("run.log").display()
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

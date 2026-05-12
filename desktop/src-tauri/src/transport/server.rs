@@ -44,11 +44,13 @@ pub async fn serve(
             }
         };
         tcp.set_nodelay(true).ok();
+        tracing::info!("incoming TCP from {peer_addr}");
         let acceptor = acceptor.clone();
         let tx = incoming_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_one(tcp, peer_addr, acceptor, tx).await {
-                tracing::debug!("connection from {peer_addr} dropped: {e}");
+            match handle_one(tcp, peer_addr, acceptor, tx).await {
+                Ok(()) => tracing::info!("WS upgrade complete for {peer_addr}; passed to handshake driver"),
+                Err(e) => tracing::warn!("connection from {peer_addr} dropped before pairing: {e:#}"),
             }
         });
     }
@@ -60,7 +62,9 @@ async fn handle_one(
     acceptor: TlsAcceptor,
     tx: mpsc::Sender<AcceptedClient>,
 ) -> anyhow::Result<()> {
-    let tls_inner = acceptor.accept(tcp).await?;
+    let tls_inner = acceptor.accept(tcp).await
+        .map_err(|e| anyhow::anyhow!("TLS accept from {peer_addr} failed: {e}"))?;
+    tracing::info!("TLS 1.3 handshake complete with {peer_addr}");
     let tls = ServerTlsStream::Server(tls_inner);
 
     // We sniff the WS upgrade URI inside the callback so we can pull

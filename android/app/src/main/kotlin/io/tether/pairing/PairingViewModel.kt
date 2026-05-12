@@ -29,7 +29,7 @@ sealed interface PairingUiState {
     data class Card(val peerName: String, val emojis: List<String>) : PairingUiState
     data object ManualForm : PairingUiState
     data class Paired(val peerName: String) : PairingUiState
-    data class Mismatch(val reason: String) : PairingUiState
+    data class Mismatch(val reason: String, val detail: String? = null) : PairingUiState
     data object Exhausted : PairingUiState
 }
 
@@ -285,11 +285,16 @@ class PairingViewModel(
             delay(2_500)
             ws.close()
         } catch (e: Throwable) {
-            _state.value = PairingUiState.Mismatch(
-                if (e.message?.contains("user_mismatch") == true) "user_mismatch"
-                else if (e.message?.contains("timeout") == true) "timeout"
-                else "protocol"
-            )
+            // Surface the real exception under the category so we
+            // can debug field failures from the screenshot alone,
+            // not "Something didn't add up about the other device."
+            android.util.Log.w("Tether", "handshake failed", e)
+            val category = when {
+                e.message?.contains("user_mismatch") == true -> "user_mismatch"
+                e.message?.contains("timeout") == true -> "timeout"
+                else -> "protocol"
+            }
+            _state.value = PairingUiState.Mismatch(category, e.toString())
         }
     }
 
