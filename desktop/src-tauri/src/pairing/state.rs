@@ -39,6 +39,20 @@ use tokio::time::{timeout, Duration};
 /// has its own, longer, 60 s timeout.
 const PRE_CARD_RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wrong PIN guesses allowed before manual entry is closed.
+const MANUAL_PIN_MAX_ATTEMPTS: u32 = 5;
+
+/// How long a displayed manual-entry PIN stays valid.
+const MANUAL_PIN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Length-checked, data-independent-time byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Events emitted to the frontend on the `pairing` event channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -67,6 +81,9 @@ pub enum PairingUiEvent {
     Card {
         peer_device_name: String,
         emojis: [String; 3],
+        /// IP address the peer connected from, so the user can tell a
+        /// stranger on the network from their own phone.
+        peer_addr: String,
     },
 
     /// Manual-entry escape hatch opened on the PC. Frontend renders
@@ -109,6 +126,10 @@ struct Inner {
     /// PIN on `?pin=` whenever a client has come in via the manual
     /// path.
     manual_pin: Option<String>,
+    /// Wrong-PIN guesses since the PIN was shown.
+    manual_pin_attempts: u32,
+    /// When the displayed PIN stops being valid.
+    manual_pin_expires_at: Option<tokio::time::Instant>,
 }
 
 impl PairingState {
@@ -121,6 +142,8 @@ impl PairingState {
                 card_active: false,
                 _mdns: None,
                 manual_pin: None,
+                manual_pin_attempts: 0,
+                manual_pin_expires_at: None,
             })),
             options,
             store,
@@ -237,31 +260,59 @@ impl PairingState {
         Ok(())
     }
 
+    /// PIN gate for the manual-entry path. Enforced only while a PIN is
+    /// displayed. The PIN expires after `MANUAL_PIN_TTL`, and after
+    /// `MANUAL_PIN_MAX_ATTEMPTS` wrong guesses manual entry is closed
+    /// (the PIN is cleared) so it cannot be brute-forced.
+    async fn check_pin(&self, supplied: Option<&str>, peer_addr: SocketAddr) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().await;
+        if let Some(exp) = g.manual_pin_expires_at {
+            if tokio::time::Instant::now() >= exp {
+                tracing::info!("manual-entry PIN expired; closing manual entry");
+                g.manual_pin = None;
+                g.manual_pin_expires_at = None;
+                g.manual_pin_attempts = 0;
+            }
+        }
+        let expected = match g.manual_pin.clone() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        match supplied {
+            Some(got) if constant_time_eq(got.as_bytes(), expected.as_bytes()) => {
+                tracing::info!("{peer_addr} supplied correct PIN");
+                Ok(())
+            }
+            _ => {
+                g.manual_pin_attempts += 1;
+                tracing::warn!(
+                    "{peer_addr} missing/wrong PIN (attempt {}/{}); rejecting",
+                    g.manual_pin_attempts,
+                    MANUAL_PIN_MAX_ATTEMPTS
+                );
+                if g.manual_pin_attempts >= MANUAL_PIN_MAX_ATTEMPTS {
+                    tracing::warn!("too many wrong PINs; closing manual entry");
+                    g.manual_pin = None;
+                    g.manual_pin_expires_at = None;
+                    g.manual_pin_attempts = 0;
+                }
+                anyhow::bail!("incoming client missing or wrong PIN");
+            }
+        }
+    }
+
     /// Drive the handshake with one accepted client end-to-end.
     async fn handle_client(&self, client: AcceptedClient) -> anyhow::Result<()> {
         let peer_addr = client.peer_addr;
         tracing::info!("starting handshake with {peer_addr}");
-        // PIN gate (only when the manual-entry path is currently
-        // open). Cleartext compare is fine — the PIN is a throw-away
-        // 6-digit value displayed on screen.
-        {
-            let g = self.inner.lock().await;
-            if let Some(expected) = g.manual_pin.as_ref() {
-                match client.pin.as_ref() {
-                    Some(got) if got == expected => {
-                        tracing::info!("{peer_addr} supplied correct PIN");
-                    }
-                    _ => {
-                        tracing::warn!("{peer_addr} missing/wrong PIN; rejecting");
-                        anyhow::bail!("incoming client missing or wrong PIN");
-                    }
-                }
-            }
-        }
+        // PIN gate (only when the manual-entry path is currently open).
+        self.check_pin(client.pin.as_deref(), peer_addr).await?;
 
         let mut ws = WsChannel::from_accepted(client.ws);
         let local_cert_fp = own_cert_sha256().await?;
-        let result = self.drive_handshake(&mut ws, local_cert_fp).await;
+        let result = self
+            .drive_handshake(&mut ws, local_cert_fp, peer_addr.ip().to_string())
+            .await;
         {
             // Whatever happened, no card is waiting on the user any more.
             let mut g = self.inner.lock().await;
@@ -282,6 +333,7 @@ impl PairingState {
         &self,
         ws: &mut WsChannel<S>,
         local_cert_fp: Vec<u8>,
+        peer_addr: String,
     ) -> anyhow::Result<()> {
         // 1. hello (send ours)
         let handshake = Handshake::new();
@@ -377,9 +429,14 @@ impl PairingState {
             (g.user_confirmed.clone(), g.user_mismatch.clone())
         };
 
+        // The peer chooses its own name: cap its length and strip
+        // control / bidi characters before it is shown or stored.
+        let peer_name = sanitize_device_name(&peer_verify.body.device_name);
+
         self.emit(PairingUiEvent::Card {
-            peer_device_name: peer_verify.body.device_name.clone(),
+            peer_device_name: peer_name.clone(),
             emojis,
+            peer_addr,
         })
         .await?;
         tracing::info!("pairing card shown — waiting for both confirms");
@@ -464,7 +521,7 @@ impl PairingState {
         // 7. Persist + close out manual entry if it was open.
         let device = PairedDevice {
             peer_device_type: peer_hello.body.device_type.clone(),
-            peer_device_name: peer_verify.body.device_name.clone(),
+            peer_device_name: peer_name.clone(),
             peer_x25519_pubkey: peer_hello.body.ecdh_pubkey.clone(),
             // Server side: we never received the peer's TLS cert
             // because we never asked for client certs during initial
@@ -479,10 +536,12 @@ impl PairingState {
         {
             let mut g = self.inner.lock().await;
             g.manual_pin = None;
+            g.manual_pin_attempts = 0;
+            g.manual_pin_expires_at = None;
         }
 
         self.emit(PairingUiEvent::Paired {
-            peer_device_name: peer_verify.body.device_name,
+            peer_device_name: peer_name,
         })
         .await
         .ok();
@@ -517,6 +576,8 @@ impl PairingState {
         {
             let mut g = self.inner.lock().await;
             g.manual_pin = Some(pin.clone());
+            g.manual_pin_attempts = 0;
+            g.manual_pin_expires_at = Some(tokio::time::Instant::now() + MANUAL_PIN_TTL);
         }
         let ip = local_v4_address()
             .map(|s| s.to_string())
@@ -534,6 +595,8 @@ impl PairingState {
     pub async fn reset(&self) -> anyhow::Result<()> {
         let mut g = self.inner.lock().await;
         g.manual_pin = None;
+        g.manual_pin_attempts = 0;
+        g.manual_pin_expires_at = None;
         Ok(())
     }
 
@@ -543,6 +606,39 @@ impl PairingState {
             let _ = tx.send(evt).await;
         }
         Ok(())
+    }
+}
+
+/// Longest peer device name we will display or persist.
+const MAX_DEVICE_NAME_CHARS: usize = 40;
+
+/// Bidirectional-text and invisible formatting characters that can be
+/// used to spoof how a name renders.
+fn is_spoofing_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Clean a peer-supplied device name: drop control and bidi/invisible
+/// characters, trim, cap at `MAX_DEVICE_NAME_CHARS`, never return empty.
+pub(crate) fn sanitize_device_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_spoofing_format_char(*c))
+        .take(MAX_DEVICE_NAME_CHARS)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "Unknown device".into()
+    } else {
+        cleaned.to_string()
     }
 }
 
@@ -657,7 +753,7 @@ mod tests {
         let st = Arc::clone(&state);
         let driver = tokio::spawn(async move {
             let mut ws = WsChannel::from_accepted(srv);
-            st.drive_handshake(&mut ws, vec![7u8; 32]).await
+            st.drive_handshake(&mut ws, vec![7u8; 32], "127.0.0.1".into()).await
         });
 
         let mut peer = WsChannel::from_accepted(cli);
@@ -717,6 +813,68 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test]
+    async fn correct_pin_still_works_below_the_attempt_limit() {
+        let (state, _p) = test_state("pin-ok", Duration::from_secs(5));
+        let addr: SocketAddr = "192.0.2.1:5555".parse().unwrap();
+        state.open_manual_entry().await.unwrap();
+        let pin = state.inner.lock().await.manual_pin.clone().unwrap();
+
+        // A few typos (wrong value, missing PIN), then the right PIN.
+        assert!(state.check_pin(Some("not-it"), addr).await.is_err());
+        assert!(state.check_pin(None, addr).await.is_err());
+        state.check_pin(Some(&pin), addr).await.unwrap();
+        assert!(state.inner.lock().await.manual_pin.is_some());
+    }
+
+    #[tokio::test]
+    async fn pin_attempts_close_manual_entry() {
+        let (state, _p) = test_state("pin-lock", Duration::from_secs(5));
+        let addr: SocketAddr = "192.0.2.1:5555".parse().unwrap();
+        state.open_manual_entry().await.unwrap();
+        let pin = state.inner.lock().await.manual_pin.clone().unwrap();
+        let wrong = if pin == "000000" { "111111" } else { "000000" };
+
+        for i in 1..=MANUAL_PIN_MAX_ATTEMPTS {
+            assert!(state.check_pin(Some(wrong), addr).await.is_err(), "attempt {i}");
+        }
+        assert!(
+            state.inner.lock().await.manual_pin.is_none(),
+            "manual entry must close after {MANUAL_PIN_MAX_ATTEMPTS} wrong PINs"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_pin_closes_manual_entry() {
+        let (state, _p) = test_state("pin-expiry", Duration::from_secs(5));
+        let addr: SocketAddr = "192.0.2.1:5555".parse().unwrap();
+        state.open_manual_entry().await.unwrap();
+        {
+            let mut g = state.inner.lock().await;
+            g.manual_pin_expires_at = Some(tokio::time::Instant::now() - Duration::from_secs(1));
+        }
+        // Expired: manual entry is closed, so the gate no longer applies.
+        state.check_pin(Some("wrong"), addr).await.unwrap();
+        assert!(state.inner.lock().await.manual_pin.is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        assert!(constant_time_eq(b"123456", b"123456"));
+        assert!(!constant_time_eq(b"123456", b"123457"));
+        assert!(!constant_time_eq(b"123456", b"12345"));
+    }
+
+    #[test]
+    fn device_names_are_sanitized() {
+        assert_eq!(sanitize_device_name("Will's Pixel"), "Will's Pixel");
+        assert_eq!(sanitize_device_name("  \u{202E}evil\u{200B}\n\t name  "), "evil name");
+        assert_eq!(sanitize_device_name("\u{202E}\u{0007}"), "Unknown device");
+        assert_eq!(sanitize_device_name(""), "Unknown device");
+        let long = "x".repeat(500);
+        assert_eq!(sanitize_device_name(&long).chars().count(), MAX_DEVICE_NAME_CHARS);
+    }
+
     /// A peer that finishes the WebSocket upgrade and then stays
     /// silent must be dropped by the pre-card timeout, not hang forever.
     #[tokio::test]
@@ -726,7 +884,7 @@ mod tests {
         let st = Arc::clone(&state);
         let driver = tokio::spawn(async move {
             let mut ws = WsChannel::from_accepted(srv);
-            st.drive_handshake(&mut ws, vec![7u8; 32]).await
+            st.drive_handshake(&mut ws, vec![7u8; 32], "127.0.0.1".into()).await
         });
         let res = timeout(Duration::from_secs(3), driver)
             .await

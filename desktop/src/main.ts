@@ -8,7 +8,7 @@ import { t } from "./ui/strings";
 type PairingEvent =
   | { kind: "status_key"; key: string }
   | { kind: "listening"; ip: string; port: number; firewall_ok: boolean; log_path: string }
-  | { kind: "card"; peer_device_name: string; emojis: [string, string, string] }
+  | { kind: "card"; peer_device_name: string; emojis: [string, string, string]; peer_addr?: string }
   | { kind: "manual_entry_pin"; ip: string; pin: string }
   | { kind: "paired"; peer_device_name: string }
   | { kind: "mismatch"; reason: string };
@@ -161,7 +161,7 @@ function safeText(key: string): string {
   }
 }
 
-function renderCard(peer: string, emojis: [string, string, string]) {
+function renderCard(peer: string, emojis: [string, string, string], peerAddr?: string) {
   clear();
   manualLink.hidden = true;
 
@@ -172,6 +172,13 @@ function renderCard(peer: string, emojis: [string, string, string]) {
   title.className = "title";
   title.textContent = t("pair.card.title", { peer });
   card.appendChild(title);
+
+  if (peerAddr) {
+    const from = document.createElement("p");
+    from.className = "subhead";
+    from.textContent = `Connecting from ${peerAddr}`;
+    card.appendChild(from);
+  }
 
   const emojiRow = document.createElement("div");
   emojiRow.className = "emojis";
@@ -300,7 +307,7 @@ async function bootstrap() {
         renderIdle();
         break;
       case "card":
-        renderCard(data.peer_device_name, data.emojis);
+        renderCard(data.peer_device_name, data.emojis, data.peer_addr);
         break;
       case "manual_entry_pin":
         renderManualPin(data.ip, data.pin);
