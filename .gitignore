@@ -53,3 +53,16 @@ test-harness/runners/.tmp/
 .env
 .env.local
 *.local
+
+# Signing material and cloud config (never commit)
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
+google-services.json
+android/app/*.keystore
+desktop/src-tauri/*.pem
+desktop/src-tauri/*.key
+.env.*
+!.env.example
