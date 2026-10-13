@@ -1,5 +1,37 @@
 # Threat model
 
+## Known gaps (read this first)
+
+This document describes the intended design. The current code does not
+yet implement every control below, and the sections that follow should
+be read with these caveats until each item lands:
+
+- **Active MITM (A2/A3):** the 3-emoji code is the first 24 bits of an
+  HKDF over the X25519 shared secret only. There is no commitment phase
+  and the TLS certificates are not bound into it, so an active attacker
+  on the LAN who can try many key pairs can make both screens show the
+  same emojis. Treat the emoji check as protection against passive and
+  accidental mix-ups, not against a determined active attacker, until a
+  v2 protocol (commit-then-reveal, transcript-bound, longer code) ships.
+- **TLS certificate cross-check (A2/A4):** the PC stores the
+  certificate fingerprint the phone reports in `hello`; it does not
+  request a client certificate or verify it against the TLS session.
+  Only the phone pins the PC's certificate.
+- **Mutual-TLS reconnect:** there is no reconnect path yet; pairings are
+  recorded but nothing authenticates a later session against them.
+- **Stale card (A4):** the Confirm button is not disabled client-side
+  until the peer's `verify` arrives; instead the PC only renders the card
+  after that `verify`, and (since this fix) ignores Confirm/Mismatch taps
+  when no card is active.
+- **Rate limiting:** the per-IP backoff described below is not
+  implemented. The manual-entry PIN does expire (5 minutes) and is
+  closed after 5 wrong guesses.
+- **Listener exposure:** the PC listens and advertises for the whole
+  lifetime of the app, not only during a pairing window.
+- **USB token:** the token pushed over `adb` is not validated by the
+  desktop or the phone; the Android provider is merely restricted to
+  the adb shell and to the Tether port.
+
 ## Scope
 
 Tether's pairing flow protects the moment when a phone and a PC

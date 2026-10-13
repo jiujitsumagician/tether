@@ -77,8 +77,6 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk15to18:1.78.1")
     implementation("org.bouncycastle:bcpkix-jdk15to18:1.78.1")
 
-    // OkHttp for TLS + WebSocket
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // mDNS discovery via JmDNS (Android NsdManager is fine on most
     // devices but quietly broken on a few — JmDNS gives consistent

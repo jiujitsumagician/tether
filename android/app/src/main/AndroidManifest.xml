@@ -7,14 +7,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-    <!-- Required for mDNS/zeroconf service browsing on Android 13+. -->
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"
-        tools:targetApi="33" />
-    <!-- Foreground service used during pairing to keep the transport
-         alive if the user switches apps mid-confirm. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"
-        tools:targetApi="34" />
 
     <queries>
         <!-- For the USB fallback deep-link: launch developer-options
@@ -45,12 +37,16 @@
         </activity>
 
         <!-- ContentProvider used by the desktop USB fallback to push
-             a one-time pairing token over `adb shell content insert`. -->
+             a one-time pairing token over `adb shell content insert`.
+             Guarded by DUMP, which the adb shell uid holds and ordinary
+             installed apps cannot be granted, so other apps cannot
+             inject a fake PC endpoint. -->
         <provider
             android:name=".discovery.PairingTokenProvider"
             android:authorities="io.tether.pairing"
             android:enabled="true"
             android:exported="true"
+            android:permission="android.permission.DUMP"
             android:grantUriPermissions="true" />
 
     </application>

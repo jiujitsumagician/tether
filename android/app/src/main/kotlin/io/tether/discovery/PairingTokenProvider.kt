@@ -28,6 +28,9 @@ class PairingTokenProvider : ContentProvider() {
         val token = values?.getAsString("token")
         val port = values?.getAsInteger("port") ?: TETHER_TLS_PORT
         if (token.isNullOrBlank()) return null
+        // The USB tunnel always targets the Tether TLS port; refuse
+        // anything else so this can't be used as a connect-anywhere hop.
+        if (port != TETHER_TLS_PORT) return null
         val peer = DiscoveredPeer(
             deviceType = "pc",
             name = "PC (USB)",
