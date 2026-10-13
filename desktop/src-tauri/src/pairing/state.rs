@@ -34,6 +34,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 
+/// How long to wait for each peer message that arrives before the
+/// pairing card is shown (hello, verify). The confirm wait that follows
+/// has its own, longer, 60 s timeout.
+const PRE_CARD_RECV_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Events emitted to the frontend on the `pairing` event channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -80,6 +85,9 @@ pub struct PairingState {
     inner: Arc<Mutex<Inner>>,
     options: CascadeOptions,
     store: Arc<Store>,
+    /// Per-message timeout for the pre-card reads (hello, verify).
+    /// Always `PRE_CARD_RECV_TIMEOUT` outside of tests.
+    pre_card_recv_timeout: Duration,
 }
 
 struct Inner {
@@ -88,6 +96,11 @@ struct Inner {
     user_confirmed: Arc<Notify>,
     /// Signals the active handshake task that the user reported a mismatch.
     user_mismatch: Arc<Notify>,
+    /// True only while a pairing card is on screen and a handshake is
+    /// waiting for the user's decision. Confirm/Mismatch taps outside
+    /// that window are ignored so they cannot leave a stored `Notify`
+    /// permit that auto-answers a later pairing.
+    card_active: bool,
     /// Holds the mDNS daemon alive for the app's lifetime. Drop ⇒
     /// unregister + shutdown.
     _mdns: Option<MdnsHandle>,
@@ -105,11 +118,13 @@ impl PairingState {
                 ui_tx: None,
                 user_confirmed: Arc::new(Notify::new()),
                 user_mismatch: Arc::new(Notify::new()),
+                card_active: false,
                 _mdns: None,
                 manual_pin: None,
             })),
             options,
             store,
+            pre_card_recv_timeout: PRE_CARD_RECV_TIMEOUT,
         }
     }
 
@@ -247,6 +262,11 @@ impl PairingState {
         let mut ws = WsChannel::from_accepted(client.ws);
         let local_cert_fp = own_cert_sha256().await?;
         let result = self.drive_handshake(&mut ws, local_cert_fp).await;
+        {
+            // Whatever happened, no card is waiting on the user any more.
+            let mut g = self.inner.lock().await;
+            g.card_active = false;
+        }
         match &result {
             Ok(()) => tracing::info!("handshake with {peer_addr} reached paired state"),
             Err(e) => tracing::warn!("handshake with {peer_addr} failed: {e:#}"),
@@ -282,10 +302,12 @@ impl PairingState {
         ws.send_cbor(&hello).await?;
         tracing::debug!("sent hello");
 
-        // 2. hello (receive theirs)
-        let peer_hello: Envelope<HelloBody> = ws
-            .recv_cbor()
-            .await?
+        // 2. hello (receive theirs). A peer that finishes the upgrade
+        // and then goes silent must not stall the (serial) handshake
+        // loop, so every pre-card read is time-boxed.
+        let peer_hello: Envelope<HelloBody> = timeout(self.pre_card_recv_timeout, ws.recv_cbor())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for peer hello"))??
             .ok_or_else(|| anyhow::anyhow!("connection closed before peer hello"))?;
         tracing::info!(
             "received hello from {} ({})",
@@ -326,9 +348,9 @@ impl PairingState {
         tracing::debug!("sent verify (emoji indices: {:?})", indices);
 
         // 5. verify (receive theirs) + cross-check
-        let peer_verify: Envelope<VerifyBody> = ws
-            .recv_cbor()
-            .await?
+        let peer_verify: Envelope<VerifyBody> = timeout(self.pre_card_recv_timeout, ws.recv_cbor())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for peer verify"))??
             .ok_or_else(|| anyhow::anyhow!("connection closed before peer verify"))?;
         if peer_verify.body.fingerprint != verifier.to_vec() {
             tracing::warn!("peer verifier disagrees — aborting (MITM?)");
@@ -342,17 +364,25 @@ impl PairingState {
         tracing::info!("verifier agreement: emoji indices match peer's");
 
         // 6. Card → wait for both confirms (60 s)
+        //
+        // Take fresh Notify objects for THIS handshake before the card
+        // is shown: any permit left over from an earlier tap (peer
+        // dropped just before the click, double tap) is discarded, and
+        // taps are only accepted from here on (card_active).
+        let (user_confirmed, user_mismatch) = {
+            let mut g = self.inner.lock().await;
+            g.user_confirmed = Arc::new(Notify::new());
+            g.user_mismatch = Arc::new(Notify::new());
+            g.card_active = true;
+            (g.user_confirmed.clone(), g.user_mismatch.clone())
+        };
+
         self.emit(PairingUiEvent::Card {
             peer_device_name: peer_verify.body.device_name.clone(),
             emojis,
         })
         .await?;
         tracing::info!("pairing card shown — waiting for both confirms");
-
-        let (user_confirmed, user_mismatch) = {
-            let g = self.inner.lock().await;
-            (g.user_confirmed.clone(), g.user_mismatch.clone())
-        };
 
         let confirm_result = timeout(Duration::from_secs(60), async {
             let mut peer_confirm_received = false;
@@ -461,13 +491,21 @@ impl PairingState {
 
     pub async fn user_confirm(&self) -> anyhow::Result<()> {
         let g = self.inner.lock().await;
-        g.user_confirmed.notify_one();
+        if g.card_active {
+            g.user_confirmed.notify_one();
+        } else {
+            tracing::debug!("confirm ignored: no pairing card is active");
+        }
         Ok(())
     }
 
     pub async fn user_mismatch(&self) -> anyhow::Result<()> {
         let g = self.inner.lock().await;
-        g.user_mismatch.notify_one();
+        if g.card_active {
+            g.user_mismatch.notify_one();
+        } else {
+            tracing::debug!("mismatch ignored: no pairing card is active");
+        }
         Ok(())
     }
 
@@ -550,4 +588,152 @@ async fn probe_listener(port: u16) -> bool {
         .await,
         Ok(Ok(_))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pairing::handshake::HelloBody;
+    use std::path::PathBuf;
+    use tokio::io::{duplex, DuplexStream};
+    use tokio_tungstenite::{accept_async, client_async, WebSocketStream};
+
+    async fn ws_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>) {
+        let (a, b) = duplex(64 * 1024);
+        let (srv, cli) = tokio::join!(
+            accept_async(a),
+            client_async("ws://tether.local/tether/v1", b)
+        );
+        (srv.unwrap(), cli.unwrap().0)
+    }
+
+    fn test_state(tag: &str, pre_card: Duration) -> (Arc<PairingState>, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "tether-state-test-{}-{tag}.json",
+            std::process::id()
+        ));
+        let store = Arc::new(Store::open_at(path.clone()));
+        let mut st = PairingState::new(store, CascadeOptions::default());
+        st.pre_card_recv_timeout = pre_card;
+        (Arc::new(st), path)
+    }
+
+    fn peer_hello(pubkey: Vec<u8>) -> Envelope<HelloBody> {
+        Envelope {
+            v: 1,
+            kind: "hello".into(),
+            id: 1,
+            in_reply_to: None,
+            body: HelloBody {
+                device_type: "phone".into(),
+                device_name: "test-phone".into(),
+                protocol_version: 1,
+                ecdh_pubkey: pubkey,
+                tls_cert_sha256: vec![9u8; 32],
+            },
+        }
+    }
+
+    /// A Confirm/Mismatch tap with no card on screen (or a permit left
+    /// over from an earlier card) must not answer a later pairing.
+    #[tokio::test]
+    async fn stale_confirm_does_not_auto_confirm_next_handshake() {
+        let (state, path) = test_state("stale", Duration::from_secs(5));
+        let (ui_tx, mut ui_rx) = mpsc::channel::<PairingUiEvent>(32);
+        state.inner.lock().await.ui_tx = Some(ui_tx);
+
+        // Taps while no handshake is waiting: must be ignored...
+        state.user_confirm().await.unwrap();
+        state.user_mismatch().await.unwrap();
+        // ...and even a permit that somehow got stored must be discarded
+        // when the next handshake starts.
+        {
+            let g = state.inner.lock().await;
+            g.user_confirmed.notify_one();
+            g.user_mismatch.notify_one();
+        }
+
+        let (srv, cli) = ws_pair().await;
+        let st = Arc::clone(&state);
+        let driver = tokio::spawn(async move {
+            let mut ws = WsChannel::from_accepted(srv);
+            st.drive_handshake(&mut ws, vec![7u8; 32]).await
+        });
+
+        let mut peer = WsChannel::from_accepted(cli);
+        let hs = Handshake::new();
+        let peer_pub = hs.local_pub.as_bytes().to_vec();
+        let pc_hello: Envelope<HelloBody> = peer.recv_cbor().await.unwrap().unwrap();
+        peer.send_cbor(&peer_hello(peer_pub)).await.unwrap();
+        let verifier = hs.derive(&pc_hello.body.ecdh_pubkey).unwrap();
+        let pc_verify: Envelope<VerifyBody> = peer.recv_cbor().await.unwrap().unwrap();
+        let verify = Envelope {
+            v: 1,
+            kind: "verify".into(),
+            id: 2,
+            in_reply_to: Some(pc_hello.id),
+            body: VerifyBody {
+                fingerprint: verifier.to_vec(),
+                emoji_indices: emoji_code::indices_from_verifier(&verifier),
+                device_name: "test-phone".into(),
+            },
+        };
+        peer.send_cbor(&verify).await.unwrap();
+
+        // Wait for the card to be shown.
+        loop {
+            match ui_rx.recv().await.expect("ui channel closed") {
+                PairingUiEvent::Card { .. } => break,
+                PairingUiEvent::Mismatch { reason } => {
+                    panic!("handshake auto-aborted before the card: {reason}")
+                }
+                _ => continue,
+            }
+        }
+
+        // No confirm may be sent until the user actually taps Confirm.
+        let early = timeout(Duration::from_millis(400), peer.recv_cbor::<ConfirmBody>()).await;
+        assert!(early.is_err(), "handshake answered without a user tap");
+
+        // A real tap now confirms normally.
+        state.user_confirm().await.unwrap();
+        let pc_confirm: Envelope<ConfirmBody> = timeout(Duration::from_secs(2), peer.recv_cbor())
+            .await
+            .expect("no confirm after a real tap")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pc_confirm.kind, "confirm");
+        peer.send_cbor(&Envelope {
+            v: 1,
+            kind: "confirm".into(),
+            id: 3,
+            in_reply_to: Some(pc_verify.id),
+            body: ConfirmBody { confirmed: true },
+        })
+        .await
+        .unwrap();
+
+        driver.await.unwrap().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A peer that finishes the WebSocket upgrade and then stays
+    /// silent must be dropped by the pre-card timeout, not hang forever.
+    #[tokio::test]
+    async fn silent_peer_is_dropped_by_pre_card_timeout() {
+        let (state, path) = test_state("silent", Duration::from_millis(200));
+        let (srv, _cli_kept_open_but_silent) = ws_pair().await;
+        let st = Arc::clone(&state);
+        let driver = tokio::spawn(async move {
+            let mut ws = WsChannel::from_accepted(srv);
+            st.drive_handshake(&mut ws, vec![7u8; 32]).await
+        });
+        let res = timeout(Duration::from_secs(3), driver)
+            .await
+            .expect("drive_handshake hung on a silent peer")
+            .unwrap();
+        let err = res.expect_err("silent peer must not pair");
+        assert!(format!("{err:#}").contains("timed out"), "got: {err:#}");
+        let _ = std::fs::remove_file(&path);
+    }
 }

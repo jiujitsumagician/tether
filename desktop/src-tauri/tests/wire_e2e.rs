@@ -31,8 +31,75 @@ use tether_core::{
 };
 use tokio::sync::mpsc;
 
+// The tests share the on-disk TLS cert; run them one at a time so a
+// first run on a clean machine can't race on generating it.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn pair_completes_end_to_end_over_loopback() {
+    run_pairing(false).await;
+}
+
+/// Stalled peers (raw TCP that never speaks TLS, or TLS that never
+/// upgrades) must not stop a real client from pairing.
+#[tokio::test]
+async fn pairing_still_works_with_silent_connections_open() {
+    run_pairing(true).await;
+}
+
+/// Messages larger than the listener's cap are rejected instead of
+/// being buffered.
+#[tokio::test]
+async fn oversized_ws_message_is_rejected() {
+    let _guard = SERIAL.lock().await;
+    let port = pick_port().await;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let (accept_tx, mut accept_rx) = mpsc::channel::<AcceptedClient>(1);
+    tokio::spawn(async move {
+        let _ = serve(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), accept_tx).await;
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let tls = TlsClient::dial(&addr, "").await.unwrap();
+    let mut client_ws = WsChannel::upgrade(tls, None).await.unwrap();
+    let accepted = tokio::time::timeout(Duration::from_secs(5), accept_rx.recv())
+        .await
+        .expect("server didn't accept within 5s")
+        .expect("accept channel closed");
+    let mut server_ws = WsChannel::from_accepted(accepted.ws);
+
+    let big = Envelope {
+        v: 1,
+        kind: "hello".into(),
+        id: 1,
+        in_reply_to: None,
+        body: HelloBody {
+            device_type: "phone".into(),
+            device_name: "x".repeat(256 * 1024),
+            protocol_version: 1,
+            ecdh_pubkey: vec![0u8; 32],
+            tls_cert_sha256: vec![0u8; 32],
+        },
+    };
+    // Send from a separate task: the server isn't reading until below,
+    // so a large write could otherwise block this test.
+    tokio::spawn(async move {
+        let _ = client_ws.send_cbor(&big).await;
+        // Keep the client alive until the server has made its decision.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(client_ws);
+    });
+    let got = tokio::time::timeout(Duration::from_secs(5), server_ws.recv_cbor::<HelloBody>())
+        .await
+        .expect("server hung on an oversized message");
+    assert!(
+        !matches!(got, Ok(Some(_))),
+        "oversized message must not be delivered"
+    );
+}
+
+async fn run_pairing(with_silent_connections: bool) {
+    let _guard = SERIAL.lock().await;
     // tracing helps when --nocapture; silently a no-op otherwise.
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -49,6 +116,14 @@ async fn pair_completes_end_to_end_over_loopback() {
 
     // Give the listener a beat to actually bind.
     tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Optional stalled peers, held open for the whole test.
+    let mut _silent_tcp = None;
+    let mut _silent_tls = None;
+    if with_silent_connections {
+        _silent_tcp = Some(tokio::net::TcpStream::connect(addr).await.unwrap());
+        _silent_tls = Some(TlsClient::dial(&addr, "").await.unwrap());
+    }
 
     // 2) Client side: dial + run client-role handshake.
     let client_task = tokio::spawn(async move { client_handshake(addr).await });

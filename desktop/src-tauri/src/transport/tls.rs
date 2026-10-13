@@ -181,12 +181,48 @@ pub fn cert_short_fp(fp_bytes: &[u8]) -> String {
         .collect::<String>()
 }
 
+/// Create the per-user data directory if needed. On Unix it is made
+/// private to the owner (0700) so other local users cannot read the TLS
+/// key or the pairing list; Windows keeps its default per-user ACLs.
+pub async fn create_private_dir(dir: &std::path::Path) {
+    tokio::fs::create_dir_all(dir).await.ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .ok();
+    }
+}
+
+/// Write `contents` to `path`, creating the file readable/writable by
+/// the owner only (0600) on Unix. Windows behavior is unchanged.
+pub async fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(path).await?;
+    f.write_all(contents).await?;
+    f.flush().await?;
+    Ok(())
+}
+
 pub async fn ensure_local_cert() -> anyhow::Result<(String, Vec<u8>, String)> {
     let dir = data_dir()?;
-    tokio::fs::create_dir_all(&dir).await.ok();
+    create_private_dir(&dir).await;
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("cert.key");
     if cert_path.exists() && key_path.exists() {
+        // Tighten a key written by an earlier build with default perms.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .ok();
+        }
         let cert_pem = tokio::fs::read_to_string(&cert_path).await?;
         let key_pem = tokio::fs::read_to_string(&key_path).await?;
         let mut cursor = std::io::Cursor::new(cert_pem.as_bytes());
@@ -203,7 +239,7 @@ pub async fn ensure_local_cert() -> anyhow::Result<(String, Vec<u8>, String)> {
     let key_pem = cert.key_pair.serialize_pem();
     let der = cert.cert.der().to_vec();
     tokio::fs::write(&cert_path, &cert_pem).await?;
-    tokio::fs::write(&key_path, &key_pem).await?;
+    write_private(&key_path, key_pem.as_bytes()).await?;
     Ok((cert_pem, der, key_pem))
 }
 

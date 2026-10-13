@@ -10,10 +10,28 @@ use super::tls::{server_config, ServerTlsStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::WebSocketStream;
+
+/// Upper bound on how long a connection may take to finish the TLS
+/// handshake, and (separately) the WebSocket upgrade. A real phone does
+/// both in milliseconds; this only drops stalled or hostile peers.
+const ACCEPT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Max size of a single WebSocket message / frame. Handshake envelopes
+/// are well under 1 KiB, so 64 KiB leaves ample headroom while keeping
+/// an unauthenticated peer from making us buffer tungstenite's default
+/// 64 MiB messages.
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Max number of connections that may be between TCP accept and
+/// finished WebSocket upgrade at the same time. Further connections are
+/// dropped immediately.
+const MAX_PENDING_CONNECTIONS: usize = 32;
 
 pub struct AcceptedClient {
     pub peer_addr: SocketAddr,
@@ -34,6 +52,7 @@ pub async fn serve(
     let cfg = server_config().await?;
     let acceptor = TlsAcceptor::from(cfg);
     tracing::info!("tether TLS listener bound on {bind_addr}");
+    let pending = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
 
     loop {
         let (tcp, peer_addr) = match listener.accept().await {
@@ -45,9 +64,17 @@ pub async fn serve(
         };
         tcp.set_nodelay(true).ok();
         tracing::info!("incoming TCP from {peer_addr}");
+        let permit = match Arc::clone(&pending).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("too many pending connections; dropping {peer_addr}");
+                continue;
+            }
+        };
         let acceptor = acceptor.clone();
         let tx = incoming_tx.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match handle_one(tcp, peer_addr, acceptor, tx).await {
                 Ok(()) => tracing::info!("WS upgrade complete for {peer_addr}; passed to handshake driver"),
                 Err(e) => tracing::warn!("connection from {peer_addr} dropped before pairing: {e:#}"),
@@ -62,7 +89,9 @@ async fn handle_one(
     acceptor: TlsAcceptor,
     tx: mpsc::Sender<AcceptedClient>,
 ) -> anyhow::Result<()> {
-    let tls_inner = acceptor.accept(tcp).await
+    let tls_inner = timeout(ACCEPT_STEP_TIMEOUT, acceptor.accept(tcp))
+        .await
+        .map_err(|_| anyhow::anyhow!("TLS accept from {peer_addr} timed out"))?
         .map_err(|e| anyhow::anyhow!("TLS accept from {peer_addr} failed: {e}"))?;
     tracing::info!("TLS 1.3 handshake complete with {peer_addr}");
     let tls = ServerTlsStream::Server(tls_inner);
@@ -82,7 +111,17 @@ async fn handle_one(
         Ok(resp)
     };
 
-    let ws = tokio_tungstenite::accept_hdr_async(tls, callback).await?;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_WS_MESSAGE_BYTES),
+        ..Default::default()
+    };
+    let ws = timeout(
+        ACCEPT_STEP_TIMEOUT,
+        tokio_tungstenite::accept_hdr_async_with_config(tls, callback, Some(ws_config)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("WebSocket upgrade from {peer_addr} timed out"))??;
     let pin = captured_pin.lock().unwrap().clone();
     tx.send(AcceptedClient { peer_addr, ws, pin }).await.ok();
     Ok(())

@@ -99,6 +99,12 @@ impl Handshake {
         bytes.copy_from_slice(peer_pubkey);
         let peer = PublicKey::from(bytes);
         let shared = self.secret.diffie_hellman(&peer);
+        // Reject low-order / non-contributory peer keys: they force the
+        // shared secret to a value the peer can predict, which would let
+        // an attacker precompute the verifier and emoji code.
+        if !shared.was_contributory() {
+            anyhow::bail!("peer pubkey is low-order / non-contributory");
+        }
         let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
         let mut out = [0u8; VERIFIER_LEN];
         hk.expand(HKDF_INFO, &mut out)
@@ -139,6 +145,21 @@ mod tests {
         let other = Handshake::new();
         let v_other = other.derive(&c_pub).unwrap();
         assert_ne!(v_ab, v_other);
+    }
+
+    #[test]
+    fn rejects_low_order_peer_pubkeys() {
+        // The all-zero point (order 1) and (1, 0, ..., 0) (order 4) both
+        // yield a non-contributory shared secret.
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        for bad in [[0u8; 32], one] {
+            let h = Handshake::new();
+            assert!(
+                h.derive(&bad).is_err(),
+                "low-order pubkey {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

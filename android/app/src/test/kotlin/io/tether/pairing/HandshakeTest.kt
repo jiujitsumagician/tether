@@ -22,6 +22,18 @@ class HandshakeTest {
     }
 
     @Test
+    fun `low-order peer pubkey is rejected`() {
+        val alice = Handshake()
+        var rejected = false
+        try {
+            alice.derive(ByteArray(32))
+        } catch (_: RuntimeException) {
+            rejected = true
+        }
+        assertTrue("all-zero (low-order) peer pubkey must be rejected", rejected)
+    }
+
+    @Test
     fun `different pairs produce different verifiers`() {
         val alice = Handshake()
         val bob = Handshake()

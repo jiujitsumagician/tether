@@ -94,6 +94,12 @@ class WsChannel private constructor(private val tls: TlsClient) {
                 if (input.read(arr) != 4) return null
                 arr
             } else null
+            // Never allocate an attacker-announced length: handshake
+            // envelopes are tiny, and control frames are <= 125 bytes.
+            val isControl = (opcode and 0x08) != 0
+            if (len < 0 || len > MAX_FRAME_BYTES || (isControl && len > 125)) {
+                throw IOException("WebSocket frame length $len out of range")
+            }
             val payload = ByteArray(len.toInt())
             var read = 0
             while (read < payload.size) {
@@ -115,6 +121,9 @@ class WsChannel private constructor(private val tls: TlsClient) {
     }
 
     companion object {
+        /** Largest data frame we will accept from the PC. */
+        private const val MAX_FRAME_BYTES = 64L * 1024
+
         suspend fun upgrade(tls: TlsClient, pin: String?): WsChannel = withContext(Dispatchers.IO) {
             val path = "/tether/v1" + (pin?.let { "?pin=${urlencode(it)}" } ?: "")
             val key = generateWsKey()

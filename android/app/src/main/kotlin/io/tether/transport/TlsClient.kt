@@ -39,6 +39,8 @@ class TlsClient private constructor(
     fun close() { try { socket.close() } catch (_: Throwable) {} }
 
     companion object {
+        private const val READ_TIMEOUT_MS = 75_000
+
         @Synchronized
         fun dial(host: String, port: Int): TlsClient {
             ensureBcInstalled()
@@ -47,6 +49,9 @@ class TlsClient private constructor(
             val raw = ctx.socketFactory.createSocket(host, port) as SSLSocket
             // Force TLS 1.3 (rejects 1.2 fallback).
             raw.enabledProtocols = arrayOf("TLSv1.3")
+            // A silent peer must not hang a blocking read forever. Must
+            // exceed the 60 s confirm wait so slow confirms still work.
+            raw.soTimeout = READ_TIMEOUT_MS
             raw.startHandshake()
             val cert = raw.session.peerCertificates.first() as X509Certificate
             val der = cert.encoded

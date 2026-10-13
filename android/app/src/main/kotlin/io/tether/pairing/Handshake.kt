@@ -34,6 +34,11 @@ class Handshake {
         val agreement = X25519Agreement().apply { init(privateKey) }
         val shared = ByteArray(agreement.agreementSize)
         agreement.calculateAgreement(peer, shared, 0)
+        // Reject low-order / non-contributory peer keys (all-zero shared
+        // secret): the peer could otherwise predict the verifier.
+        require(!shared.all { it == 0.toByte() }) {
+            "peer pubkey is low-order / non-contributory"
+        }
 
         val hkdf = HKDFBytesGenerator(SHA256Digest())
         hkdf.init(HKDFParameters(shared, null, HKDF_INFO))
