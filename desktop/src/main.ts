@@ -28,6 +28,21 @@ function clear() {
   root.replaceChildren();
 }
 
+// Builds one "label / value" row of the manual-entry display with
+// textContent only (no HTML interpolation).
+function manualPinRow(label: string, value: string, valueClass: string): HTMLDivElement {
+  const row = document.createElement("div");
+  row.className = "manual-pin-row";
+  const labelEl = document.createElement("span");
+  labelEl.className = "label";
+  labelEl.textContent = label;
+  const valueEl = document.createElement("code");
+  valueEl.className = valueClass;
+  valueEl.textContent = value;
+  row.append(labelEl, valueEl);
+  return row;
+}
+
 function renderIdle() {
   clear();
   const h1 = document.createElement("h1");
@@ -43,15 +58,19 @@ function renderIdle() {
       root.appendChild(note);
       const logHint = document.createElement("p");
       logHint.className = "log-hint";
-      logHint.innerHTML = `If pairing still fails, the full run log is at <code>${log_path}</code>.`;
+      const logCode = document.createElement("code");
+      logCode.textContent = log_path;
+      logHint.append("If pairing still fails, the full run log is at ", logCode, ".");
       root.appendChild(logHint);
     } else {
       const warn = document.createElement("div");
       warn.className = "firewall-warn";
-      warn.innerHTML = `
-        <strong>Windows Firewall is blocking incoming connections.</strong>
-        <p>Your phone won't be able to reach this PC until you allow Tether through the firewall. We can fix that with one click — you'll see a UAC prompt.</p>
-      `;
+      const warnTitle = document.createElement("strong");
+      warnTitle.textContent = "Windows Firewall is blocking incoming connections.";
+      const warnBody = document.createElement("p");
+      warnBody.textContent =
+        "Your phone won't be able to reach this PC until you allow Tether through the firewall. We can fix that with one click — you'll see a UAC prompt.";
+      warn.append(warnTitle, warnBody);
       const btn = document.createElement("button");
       btn.className = "btn";
       btn.textContent = "Allow in Firewall";
@@ -75,7 +94,9 @@ function renderIdle() {
       warn.appendChild(btn);
       const small = document.createElement("p");
       small.className = "firewall-fallback";
-      small.innerHTML = `Prefer to do it yourself? Open PowerShell as Administrator and run: <code>New-NetFirewallRule -DisplayName "Tether (TCP listener)" -Direction Inbound -Protocol TCP -LocalPort ${port} -Action Allow -Profile Any</code>`;
+      const fwCmd = document.createElement("code");
+      fwCmd.textContent = `New-NetFirewallRule -DisplayName "Tether (TCP listener)" -Direction Inbound -Protocol TCP -LocalPort ${port} -Action Allow -Profile Any`;
+      small.append("Prefer to do it yourself? Open PowerShell as Administrator and run: ", fwCmd);
       warn.appendChild(small);
       root.appendChild(warn);
     }
@@ -241,12 +262,8 @@ function renderManualPin(ip: string, pin: string) {
 
   const block = document.createElement("div");
   block.className = "manual-pin";
-  const ipRow = document.createElement("div");
-  ipRow.className = "manual-pin-row";
-  ipRow.innerHTML = `<span class="label">PC address</span><code class="value">${ip}</code>`;
-  const pinRow = document.createElement("div");
-  pinRow.className = "manual-pin-row";
-  pinRow.innerHTML = `<span class="label">6-digit code</span><code class="value pin">${pin}</code>`;
+  const ipRow = manualPinRow("PC address", ip, "value");
+  const pinRow = manualPinRow("6-digit code", pin, "value pin");
   block.append(ipRow, pinRow);
   wrap.appendChild(block);
 
