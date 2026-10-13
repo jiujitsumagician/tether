@@ -27,8 +27,6 @@ tauri-build = { version = "2", features = [], optional = true }
 # build (cargo build / cargo run) keeps `desktop` enabled so the bin
 # target compiles normally.
 tauri = { version = "2", optional = true , features = [] }
-tauri-plugin-shell = { version = "2", optional = true }
-tauri-plugin-fs = { version = "2", optional = true }
 
 # Async runtime
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "process", "fs"] }
@@ -82,8 +80,6 @@ nix = { version = "0.29", features = ["net"] }
 default = ["desktop"]
 desktop = [
     "dep:tauri",
-    "dep:tauri-plugin-shell",
-    "dep:tauri-plugin-fs",
     "dep:tauri-build",
 ]
 
